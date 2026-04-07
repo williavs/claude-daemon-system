@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# cd-stop: Stop the daemon gracefully
+set -euo pipefail
+
+source "$(dirname "$0")/../lib/config.sh"
+
+if [ -f "$DAEMON_HOME/state/daemon.pid" ]; then
+    pid=$(cat "$DAEMON_HOME/state/daemon.pid")
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid"
+        echo "Daemon stopped (PID $pid)"
+    else
+        echo "Daemon not running (stale PID file)"
+        rm -f "$DAEMON_HOME/state/daemon.pid"
+    fi
+else
+    echo "Daemon not running"
+fi

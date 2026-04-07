@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# cd-status: Show daemon status at a glance
+set -euo pipefail
+
+source "$(dirname "$0")/../lib/config.sh"
+STATE_DIR="$DAEMON_HOME/state"
+TASKS_DIR="$DAEMON_HOME/tasks"
+LOGS_DIR="$DAEMON_HOME/logs"
+
+# Colors
+R='\033[0;31m'
+G='\033[0;32m'
+Y='\033[0;33m'
+B='\033[0;34m'
+C='\033[0;36m'
+W='\033[1;37m'
+D='\033[0m'
+
+echo -e "${W}Claude Daemon Status${D}"
+echo "===================="
+
+# Daemon state
+if [ -f "$STATE_DIR/daemon.pid" ] && kill -0 "$(cat "$STATE_DIR/daemon.pid")" 2>/dev/null; then
+    echo -e "State:    ${G}RUNNING${D} (PID $(cat "$STATE_DIR/daemon.pid"))"
+else
+    echo -e "State:    ${R}STOPPED${D}"
+fi
+
+# Circuit breaker
+if [ -f "$STATE_DIR/circuit.json" ]; then
+    cb_state=$(jq -r '.state' "$STATE_DIR/circuit.json")
+    cb_failures=$(jq '.consecutive_failures' "$STATE_DIR/circuit.json")
+    case "$cb_state" in
+        CLOSED)    echo -e "Circuit:  ${G}CLOSED${D} ($cb_failures failures)" ;;
+        HALF_OPEN) echo -e "Circuit:  ${Y}HALF_OPEN${D} (testing)" ;;
+        OPEN)      echo -e "Circuit:  ${R}OPEN${D} (cooling down)" ;;
+    esac
+fi
+
+# Budget
+if [ -f "$STATE_DIR/budget.json" ]; then
+    tokens=$(jq '.tokens_used' "$STATE_DIR/budget.json")
+    calls=$(jq '.calls_made' "$STATE_DIR/budget.json")
+    max_t=$(jq '.max_tokens_per_hour // 200000' "$DAEMON_HOME/config.json")
+    max_c=$(jq '.max_calls_per_hour // 20' "$DAEMON_HOME/config.json")
+    echo -e "Budget:   ${C}${tokens}${D}/${max_t} tokens, ${C}${calls}${D}/${max_c} calls (this hour)"
+fi
+
+echo ""
+
+# Task counts
+pending=0; in_progress=0; completed=0; failed=0
+for f in "$TASKS_DIR"/task-*.json; do
+    [ -f "$f" ] || continue
+    status=$(jq -r '.status' "$f")
+    case "$status" in
+        pending) pending=$((pending + 1)) ;;
+        in_progress) in_progress=$((in_progress + 1)) ;;
+        completed) completed=$((completed + 1)) ;;
+        failed) failed=$((failed + 1)) ;;
+    esac
+done
+echo -e "Tasks:    ${Y}${pending} pending${D}, ${B}${in_progress} in_progress${D}, ${G}${completed} completed${D}, ${R}${failed} failed${D}"
+
+# Active tasks
+for f in "$TASKS_DIR"/task-*.json; do
+    [ -f "$f" ] || continue
+    status=$(jq -r '.status' "$f")
+    if [ "$status" = "in_progress" ]; then
+        task_id=$(jq -r '.id' "$f")
+        subject=$(jq -r '.subject' "$f")
+        model=$(jq -r '.model // "sonnet"' "$f")
+        echo -e "  Active: ${W}task-${task_id}${D} (${model}) ${subject}"
+    fi
+done
+
+echo ""
+
+# Cost today
+if [ -f "$LOGS_DIR/cost.jsonl" ] && [ -s "$LOGS_DIR/cost.jsonl" ]; then
+    today=$(date -u +%Y-%m-%d)
+    today_cost=$(grep "$today" "$LOGS_DIR/cost.jsonl" 2>/dev/null | jq -s 'map(.cost_usd) | add // 0')
+    today_tokens=$(grep "$today" "$LOGS_DIR/cost.jsonl" 2>/dev/null | jq -s 'map(.tokens_in + .tokens_out) | add // 0')
+    today_calls=$(grep "$today" "$LOGS_DIR/cost.jsonl" 2>/dev/null | jq -s 'length')
+    echo -e "Today:    ${C}\$${today_cost}${D} across ${today_calls} calls (${today_tokens} tokens)"
+else
+    echo -e "Today:    ${D}No activity${D}"
+fi
+
+# Last 5 activity entries
+echo ""
+echo -e "${W}Recent Activity${D}"
+if [ -f "$LOGS_DIR/activity.jsonl" ] && [ -s "$LOGS_DIR/activity.jsonl" ]; then
+    tail -5 "$LOGS_DIR/activity.jsonl" | while read -r line; do
+        ts=$(echo "$line" | jq -r '.ts' | cut -dT -f2 | cut -d: -f1-2)
+        action=$(echo "$line" | jq -r '.action')
+        task_id=$(echo "$line" | jq -r '.task_id // ""')
+        extra=""
+        [ -n "$task_id" ] && extra=" task-${task_id}"
+        echo -e "  ${ts}  ${action}${extra}"
+    done
+else
+    echo "  No activity yet"
+fi
+
+# Lessons count
+if [ -f "$LOGS_DIR/lessons.md" ] && [ -s "$LOGS_DIR/lessons.md" ]; then
+    lesson_count=$(grep -c '^### ' "$LOGS_DIR/lessons.md" 2>/dev/null || echo 0)
+    echo ""
+    echo -e "Lessons:  ${Y}${lesson_count} captured${D}"
+fi

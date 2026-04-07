@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# cd-scan: Daily opportunity finder. Multi-pass: research -> draft -> verify -> rework -> send.
+# Runs at 7:30am via systemd timer. Budget: $2 total across all passes.
+set -uo pipefail
+
+source "$(dirname "$0")/../lib/config.sh"
+mkdir -p "$LOGS_DIR/scans" "$LOGS_DIR/scans/archive"
+
+TODAY=$(date -u +%Y-%m-%d)
+SCAN_FILE="$LOGS_DIR/scans/${TODAY}.md"
+EMAIL=$(cfg '.email.recipients')
+SEND_CMD=$(cfg '.email.send_command')
+SEARXNG_URL=$(cfg '.searxng.url')
+SEARXNG_HOST=$(cfg '.searxng.ssh_host')
+SEARXNG_ENABLED=$(cfg_bool '.searxng.enabled')
+SCAN_MODEL=$(cfg '.scan.model // "claude-opus-4-6"')
+SCAN_BUDGET=$(cfg '.scan.max_budget_usd // 2')
+SCAN_TURNS=$(cfg '.scan.max_turns // 10')
+
+search() {
+    local query="$1" count="${2:-5}"
+    if [ "$SEARXNG_ENABLED" != "true" ]; then return; fi
+    local cmd="curl -sf '${SEARXNG_URL}/search?q=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$query'))")&format=json'"
+    if [ -n "$SEARXNG_HOST" ]; then
+        ssh -o ConnectTimeout=10 "$SEARXNG_HOST" "$cmd" 2>/dev/null
+    else
+        eval "$cmd" 2>/dev/null
+    fi | jq -r ".results[:$count] | .[] | \"- \(.title)\n  \(.url)\n  \(.content[:200] // \"\")\"" 2>/dev/null
+}
+
+# --- STAGE 1: Collect signals (free) ---
+prompt_file=$(mktemp)
+
+cat > "$prompt_file" << 'HEADER'
+You are Jim, the opportunity analyst for HFL (Human Frontier Labs).
+
+## The Mission
+Help people who otherwise wouldn't be using AI use AI effectively. The buyer is NOT a developer. It's the plumber, the realtor, the lawyer, the small agency owner, the teacher.
+
+Willy does backend/infra/AI. Corn does frontend/design/brand. Two weeks to MVP. $15-99/mo self-serve.
+
+## How We Think: Clean Room
+Find a BEHAVIOR people already pay for. Strip it to the outcome. Ask: what are the hidden assumptions that make the current solution expensive or complex? Rebuild from scratch assuming AI exists. The price gap is your margin.
+
+## What We Have
+- Go/Charmbracelet TUIs, Next.js web apps, Claude API integration
+- Tailscale fleet, homelab, deployment pipelines
+- ESP32/RPi hardware for physical products
+- HFL client pipeline via humanfrontiertests.com
+
+## Past Ideas -- FULL CONTEXT
+HEADER
+
+for f in "$LOGS_DIR/scans/archive"/*.md "$LOGS_DIR/scans"/*.md; do
+    [ -f "$f" ] || continue
+    idea_name=$(grep '^\*\*[A-Z]' "$f" | head -1)
+    [ -z "$idea_name" ] && continue
+    pitch=$(sed -n '/^\*\*[A-Z]/,/^\*\*The\|^\*\*Why\|^---/p' "$f" | head -5 | tr '\n' ' ' | head -c 300)
+    echo "- ${pitch}" >> "$prompt_file"
+done
+
+if [ -f "$LOGS_DIR/scans/feedback.jsonl" ] && [ -s "$LOGS_DIR/scans/feedback.jsonl" ]; then
+    echo "" >> "$prompt_file"
+    echo "## Feedback Verdicts" >> "$prompt_file"
+    python3 -c "
+import json
+for line in open('$LOGS_DIR/scans/feedback.jsonl'):
+    d = json.loads(line.strip())
+    print(f\"- {d['idea']} [{d['verdict']}]: {d['reason']}\")
+" >> "$prompt_file" 2>/dev/null
+fi
+
+echo "" >> "$prompt_file"
+echo "Read the feedback verdicts. Every dev-tools idea has been rejected. The mission is non-technical buyers." >> "$prompt_file"
+
+echo "" >> "$prompt_file"
+echo "## Live Signals (collected $(date -u +%H:%M)Z)" >> "$prompt_file"
+
+# HN top 20
+echo "### HackerNews" >> "$prompt_file"
+curl -sf 'https://hacker-news.firebaseio.com/v0/topstories.json' 2>/dev/null | jq '.[0:20]' | jq -r '.[]' | while read -r id; do
+    curl -sf "https://hacker-news.firebaseio.com/v0/item/${id}.json" 2>/dev/null \
+        | jq -r '"- \(.title // "?") (\(.score // 0)pts, \(.descendants // 0) comments)"' 2>/dev/null
+done >> "$prompt_file"
+
+# GitHub trending
+echo "" >> "$prompt_file"
+echo "### GitHub Trending (7d)" >> "$prompt_file"
+curl -sf "https://api.github.com/search/repositories?q=created:>$(date -u -d '7 days ago' +%Y-%m-%d 2>/dev/null || date -u -v-7d +%Y-%m-%d)&sort=stars&order=desc&per_page=15" 2>/dev/null \
+    | jq -r '.items[]? | select(.stargazers_count < 50000) | "- \(.full_name) (\(.stargazers_count)★, \(.forks_count) forks): \(.description // "no desc")"' >> "$prompt_file" 2>/dev/null
+
+# Lobsters
+echo "" >> "$prompt_file"
+echo "### Lobsters" >> "$prompt_file"
+curl -sf 'https://lobste.rs/hottest.json' 2>/dev/null \
+    | jq -r '.[0:10] | .[] | "- \(.title) [\(.tags | join(","))]"' >> "$prompt_file" 2>/dev/null
+
+# Demand signals via searxng
+echo "" >> "$prompt_file"
+echo "### Demand Signals (via search)" >> "$prompt_file"
+
+echo "#### Small business owners wanting AI" >> "$prompt_file"
+search "small business AI automate wish frustrated site:reddit.com 2026" 5 >> "$prompt_file"
+echo "" >> "$prompt_file"
+echo "#### Non-tech professionals struggling" >> "$prompt_file"
+search "AI tool overwhelmed non-technical lawyer accountant realtor site:reddit.com 2026" 5 >> "$prompt_file"
+echo "" >> "$prompt_file"
+echo "#### People paying for manual work AI could do" >> "$prompt_file"
+search "paying someone to do this AI should automate site:reddit.com 2026" 5 >> "$prompt_file"
+echo "" >> "$prompt_file"
+echo "#### Niche SaaS + indie hacker signals" >> "$prompt_file"
+search "microsaas AI vertical niche revenue 2026" 3 >> "$prompt_file"
+search "indie hacker micro saas AI revenue site:reddit.com 2026" 3 >> "$prompt_file"
+echo "" >> "$prompt_file"
+
+# Competitive landscape
+echo "### Existing Tool Pricing" >> "$prompt_file"
+search "AI SaaS small business pricing per month 2026" 3 >> "$prompt_file"
+
+echo "" >> "$prompt_file"
+
+# --- STAGE 2: Draft (opus generates the idea) ---
+cat >> "$prompt_file" << 'FOOTER'
+
+## Your Task -- PASS 1: Draft
+
+Think deeply about the research above. Find a specific person with a specific pain paying too much for a bad solution.
+
+Write a draft email to Willy and Corn. Under 400 words. Conversational.
+
+IMPORTANT: For every factual claim (statistic, quote, price, percentage), add an inline citation like [1], [2] etc. At the end, list your sources:
+
+[1] Source title - URL (from the search results above)
+[2] Source title - URL
+
+If a claim comes from your training data and NOT from the search results above, mark it [UNVERIFIED] instead of a citation number. This is critical -- Willy will fact-check every number.
+
+If nothing real emerged from the research, just say so.
+FOOTER
+
+# Run pass 1: draft with citations
+draft_raw=$(claude -p "$(cat "$prompt_file")" \
+    --model "$SCAN_MODEL" \
+    --max-turns "$SCAN_TURNS" \
+    --effort max \
+    --allowedTools "WebSearch,WebFetch,mcp__reddit-mcp__*,Bash(npx nia-docs:*)" \
+    --max-budget-usd "$SCAN_BUDGET" \
+    --dangerously-skip-permissions \
+    --output-format json \
+    2>/dev/null)
+
+draft=$(echo "$draft_raw" | jq -r '.result // "No output"')
+draft_cost=$(echo "$draft_raw" | jq -r '.total_cost_usd // 0')
+draft_turns=$(echo "$draft_raw" | jq -r '.num_turns // 0')
+
+# Check if draft has content
+if [ "$draft" = "No output" ] || [ ${#draft} -lt 100 ]; then
+    printf "# Daily Opportunity - %s\n\nDraft failed (cost: \$%s, turns: %s)\n" \
+        "$TODAY" "$draft_cost" "$draft_turns" > "$SCAN_FILE"
+    if [ -n "$EMAIL" ] && [ -n "$SEND_CMD" ]; then
+        BODY="Scanner draft failed today. Cost: \$$draft_cost" RECIPIENTS="$EMAIL" SUBJECT="Daily Opportunity: ${TODAY} (failed)" eval "$SEND_CMD" 2>/dev/null
+    fi
+    printf '{"ts":"%s","action":"opportunity_scan","email":"draft_failed","cost":%s,"turns":%s}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$draft_cost" "$draft_turns" >> "$LOGS_DIR/activity.jsonl"
+    rm -f "$prompt_file"
+    exit 0
+fi
+
+# --- STAGE 3: Verify + Rework (sonnet checks claims, rewrites if needed) ---
+verify_prompt="You are a fact-checker. Below is a draft email with citations.
+
+Check every factual claim. For claims marked [UNVERIFIED], assess if plausible.
+
+YOUR OUTPUT FORMAT -- you MUST follow this exactly:
+
+If everything checks out:
+VERDICT: PASS
+[paste the full original email unchanged]
+
+If you need to fix something:
+VERDICT: CORRECTED
+CHANGES: [one line per change]
+---
+[paste the full CORRECTED email]
+
+You MUST include the full email text in your output. The email is what gets sent to the founders.
+
+DRAFT:
+$draft"
+
+# Haiku for verification -- no tools, just reasoning about plausibility.
+# Sonnet burns turns trying to search; haiku just evaluates and rewrites.
+verified_raw=$(claude -p "$verify_prompt" \
+    --model claude-haiku-4-5 \
+    --max-turns 2 \
+    --dangerously-skip-permissions \
+    --output-format json \
+    2>/dev/null)
+
+verified=$(echo "$verified_raw" | jq -r '.result // "No output"')
+verify_cost=$(echo "$verified_raw" | jq -r '.total_cost_usd // 0')
+verify_turns=$(echo "$verified_raw" | jq -r '.num_turns // 0')
+
+# Use verified version if it has content, otherwise fall back to draft
+if [ ${#verified} -gt 100 ]; then
+    final="$verified"
+else
+    final="$draft"
+fi
+
+total_cost=$(python3 -c "print(f'{$draft_cost + $verify_cost:.2f}')")
+total_turns=$((draft_turns + verify_turns))
+
+rm -f "$prompt_file"
+
+# Save
+printf "# Daily Opportunity - %s\n\nCost: \$%s | Turns: %s (draft: %s + verify: %s)\n\n%s\n" \
+    "$TODAY" "$total_cost" "$total_turns" "$draft_turns" "$verify_turns" "$final" > "$SCAN_FILE"
+
+# Email
+if [ -n "$EMAIL" ] && [ -n "$SEND_CMD" ]; then
+    BODY="$final" RECIPIENTS="$EMAIL" SUBJECT="Daily Opportunity: ${TODAY}" \
+        eval "$SEND_CMD" 2>/dev/null && email_status="sent" || email_status="failed"
+else
+    email_status="skipped"
+fi
+
+printf '{"ts":"%s","action":"opportunity_scan","email":"%s","cost":%s,"turns":%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$email_status" "$total_cost" "$total_turns" \
+    >> "$LOGS_DIR/activity.jsonl"
+
+echo "Scan complete: $SCAN_FILE (email: $email_status, cost: \$$total_cost)"

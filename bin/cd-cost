@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# cd-cost: Show cost breakdown
+set -euo pipefail
+
+source "$(dirname "$0")/../lib/config.sh"
+COST_LOG="$DAEMON_HOME/logs/cost.jsonl"
+
+W='\033[1;37m'
+C='\033[0;36m'
+G='\033[0;32m'
+Y='\033[0;33m'
+D='\033[0m'
+
+if [ ! -f "$COST_LOG" ] || [ ! -s "$COST_LOG" ]; then
+    echo "No cost data yet."
+    exit 0
+fi
+
+echo -e "${W}Cost Breakdown${D}"
+echo "=============="
+echo ""
+
+# Today
+today=$(date -u +%Y-%m-%d)
+echo -e "${W}Today ($today)${D}"
+grep "$today" "$COST_LOG" 2>/dev/null | jq -s '
+    group_by(.model) | map({
+        model: .[0].model,
+        calls: length,
+        tokens: (map(.tokens_in + .tokens_out) | add),
+        cost: (map(.cost_usd) | add)
+    }) | sort_by(.model) | .[]
+' 2>/dev/null | jq -r '
+    "  \(.model): \(.calls) calls, \(.tokens) tokens, $\(.cost | . * 1000 | round / 1000)"
+' 2>/dev/null || echo "  No activity today"
+
+echo ""
+total_cost=$(jq -s 'map(.cost_usd) | add // 0' "$COST_LOG")
+total_calls=$(jq -s 'length' "$COST_LOG")
+total_tokens=$(jq -s 'map(.tokens_in + .tokens_out) | add // 0' "$COST_LOG")
+echo -e "${W}All time${D}"
+echo -e "  Total: ${C}\$${total_cost}${D} across ${total_calls} calls (${total_tokens} tokens)"

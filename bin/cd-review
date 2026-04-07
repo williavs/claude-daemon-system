@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# cd-review: Show daemon performance for Jim to review and update program.md
+# Run this at the start of a session so Jim can see what happened and steer.
+set -euo pipefail
+
+source "$(dirname "$0")/../lib/config.sh"
+LOGS_DIR="$DAEMON_HOME/logs"
+
+W='\033[1;37m'
+C='\033[0;36m'
+G='\033[0;32m'
+Y='\033[0;33m'
+R='\033[0;31m'
+D='\033[0m'
+
+echo -e "${W}Daemon Performance Review${D}"
+echo "========================="
+echo ""
+
+# Cost summary
+echo -e "${W}Cost${D}"
+if [ -f "$LOGS_DIR/cost.jsonl" ] && [ -s "$LOGS_DIR/cost.jsonl" ]; then
+    jq -s '
+        group_by(.model) | map({
+            model: .[0].model,
+            calls: length,
+            tokens: (map(.tokens_in + .tokens_out) | add),
+            cost: (map(.cost_usd) | add)
+        }) | sort_by(.model)[] |
+        "  \(.model): \(.calls) calls, \(.tokens) tokens, $\(.cost | . * 1000 | round / 1000)"
+    ' "$LOGS_DIR/cost.jsonl" 2>/dev/null || echo "  (parse error)"
+    total=$(jq -s 'map(.cost_usd) | add // 0' "$LOGS_DIR/cost.jsonl")
+    echo -e "  ${W}Total: \$${total}${D}"
+else
+    echo "  No cost data"
+fi
+
+echo ""
+
+# Task results
+echo -e "${W}Task Results${D}"
+for f in "$DAEMON_HOME/tasks"/task-*.json; do
+    [ -f "$f" ] || continue
+    id=$(jq -r '.id' "$f")
+    status=$(jq -r '.status' "$f")
+    subject=$(jq -r '.subject' "$f")
+    cost=$(jq -r '.cost_usd // 0' "$f")
+    attempts=$(jq -r '.attempts // 0' "$f")
+    case "$status" in
+        completed) echo -e "  ${G}DONE${D}  task-${id}: ${subject} (\$${cost}, ${attempts} attempts)" ;;
+        pending)   echo -e "  ${Y}WAIT${D}  task-${id}: ${subject} (${attempts} attempts)" ;;
+        failed)    echo -e "  ${R}FAIL${D}  task-${id}: ${subject} (${attempts} attempts)" ;;
+        *)         echo -e "  ${C}${status}${D}  task-${id}: ${subject}" ;;
+    esac
+done
+
+echo ""
+
+# Self-review scores
+echo -e "${W}Self-Review Scores${D}"
+if [ -f "$LOGS_DIR/reviews.jsonl" ] && [ -s "$LOGS_DIR/reviews.jsonl" ]; then
+    tail -10 "$LOGS_DIR/reviews.jsonl" | while read -r line; do
+        task_id=$(echo "$line" | jq -r '.task_id')
+        review=$(echo "$line" | jq -r '.review')
+        echo -e "  task-${task_id}: ${review}"
+    done
+else
+    echo "  No reviews yet"
+fi
+
+echo ""
+
+# Lessons
+echo -e "${W}Lessons Captured${D}"
+if [ -f "$LOGS_DIR/lessons.md" ] && [ -s "$LOGS_DIR/lessons.md" ]; then
+    cat "$LOGS_DIR/lessons.md"
+else
+    echo "  No lessons yet"
+fi
+
+echo ""
+
+# Circuit breaker history
+echo -e "${W}Circuit Breaker${D}"
+if [ -f "$DAEMON_HOME/state/circuit.json" ]; then
+    opens=$(jq '.total_opens' "$DAEMON_HOME/state/circuit.json")
+    state=$(jq -r '.state' "$DAEMON_HOME/state/circuit.json")
+    echo -e "  State: ${state}, Total opens: ${opens}"
+fi
+
+echo ""
+echo -e "${W}program.md${D} (current)"
+echo "---"
+cat "$DAEMON_HOME/program.md"
+echo ""
+echo "---"
+echo -e "${Y}Jim: Review the above. Update program.md to improve the daemon.${D}"

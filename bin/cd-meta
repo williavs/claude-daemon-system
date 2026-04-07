@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# cd-meta: Nightly meta-agent. Reads session digests, improves the system.
+# Designed consumer-first: the meta-agent needs digests, not raw traces.
+# Run via systemd timer at 3am.
+set -uo pipefail
+
+source "$(dirname "$0")/../lib/config.sh"
+LOGS_DIR="$DAEMON_HOME/logs"
+
+mkdir -p "$LOGS_DIR/briefings" "$LOGS_DIR/meta"
+
+TODAY=$(date -u +%Y-%m-%d)
+
+# --- Gather DIGESTS (not raw traces) ---
+# Session digests: what Willy asked, what got done, which projects
+digests=""
+if [ -f "$LOGS_DIR/digests.jsonl" ] && [ -s "$LOGS_DIR/digests.jsonl" ]; then
+    digests=$(tail -15 "$LOGS_DIR/digests.jsonl" | jq -r '
+        "Session: \(.project) | \(.actions.edits) edits, \(.actions.bash) bash, \(.actions.agents) agents\n  Asked: \(.asked | join(" | "))\n  Files: \(.files_touched | join(", "))"
+    ' 2>/dev/null)
+fi
+
+# Daemon task results
+task_results=""
+for f in "$DAEMON_HOME/tasks"/task-*.json; do
+    [ -f "$f" ] || continue
+    status=$(jq -r '.status' "$f")
+    [ "$status" = "completed" ] || [ "$status" = "pending" ] || continue
+    task_results="${task_results}
+$(jq -r '"[\(.status)] \(.subject) (cost: $\(.cost_usd // 0), attempts: \(.attempts // 0))"' "$f")"
+done
+
+# Lessons learned so far
+lessons=""
+[ -f "$LOGS_DIR/lessons.md" ] && [ -s "$LOGS_DIR/lessons.md" ] && lessons=$(tail -20 "$LOGS_DIR/lessons.md")
+
+# Self-review scores
+reviews=""
+[ -f "$LOGS_DIR/reviews.jsonl" ] && [ -s "$LOGS_DIR/reviews.jsonl" ] && reviews=$(tail -5 "$LOGS_DIR/reviews.jsonl" | jq -r '"task-\(.task_id): \(.review)"' 2>/dev/null)
+
+# Current program.md (so meta-agent knows what to improve)
+program=$(cat "$DAEMON_HOME/program.md" 2>/dev/null || echo "Empty")
+
+# Daily signals (GitHub, fleet health, git activity, changelog)
+signals=""
+[ -f "$LOGS_DIR/signals/${TODAY}.md" ] && signals=$(cat "$LOGS_DIR/signals/${TODAY}.md")
+
+# --- Build focused prompt ---
+mkdir -p "$DAEMON_HOME/staging"
+prompt="You are the meta-agent for Willy's Claude Code system. You run at 3am. Willy is asleep. Your job: analyze everything that happened, identify what to improve, and TAKE ACTION on safe improvements.
+
+## What you CAN do:
+- Update program.md directly (you have write access)
+- Create new daemon task files in $DAEMON_HOME/tasks/ (the daemon will pick them up)
+- Write improvement proposals to $DAEMON_HOME/staging/ (Jim reviews when Willy wakes up)
+- Read any file on the system to investigate
+
+## What you must NOT do:
+- SSH to remote machines
+- Push to git
+- Send emails
+- Edit skills or CLAUDE.md directly (propose changes to staging/ instead)
+
+## Recent Session Digests
+${digests:-No sessions recorded yet.}
+
+## Daemon Task Results
+${task_results:-No tasks run yet.}
+
+## Self-Review Scores
+${reviews:-No reviews yet.}
+
+## Lessons From Failures
+${lessons:-None yet.}
+
+## Current Daemon Program
+${program}
+
+## Daily Signals (GitHub, fleet, git activity, changelog)
+${signals:-No signals collected today. Run cd-signals first.}
+
+---
+
+You have write access to $DAEMON_HOME/tasks/, $DAEMON_HOME/staging/, $DAEMON_HOME/program.md, and $DAEMON_HOME/logs/.
+
+DO these things:
+1. Read the signals, digests, reviews, and lessons above
+2. Investigate anything that needs deeper understanding (read files, check state)
+3. Update program.md if you have concrete improvements
+4. Create daemon tasks for anything that should be checked or fixed tomorrow
+5. Write proposals to staging/ for changes that need Jim's review
+
+Then produce these sections in your final output:
+
+### BRIEFING
+3 bullets max for Willy's morning. What happened, what needs attention, anything interesting.
+
+### PROGRAM_UPDATE
+Specific edits to program.md based on what you see in the digests and task results. If a daemon task failed, add to Known Issues. If something worked well, add to Patterns That Work. Write the exact text to add. If nothing, say NONE.
+
+### SKILL_CANDIDATES
+Look at what Willy asked for across sessions. If the same type of request appears 2+ times, it should be a skill. Name it, describe the trigger, describe what it does. If nothing, say NONE.
+
+### OPPORTUNITIES
+Connect what Willy is working on to something worth building. Be specific -- name the project, the gap, the opportunity. If nothing stands out, say NONE.
+
+Be direct. No filler."
+
+# --- Run meta-agent (opus with max thinking -- this is the brain) ---
+# Allowed tools: read-only + write only to daemon logs. No SSH, no git push, no external actions.
+# Max budget prevents runaway cost even with 30 turns.
+output=$(claude -p "$prompt" \
+    --model claude-opus-4-6 \
+    --max-turns 30 \
+    --effort max \
+    --max-budget-usd 2.00 \
+    --allowedTools "Read,Grep,Glob,Bash(cat:*),Bash(ls:*),Bash(find:*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(jq:*),Write(${DAEMON_HOME}/logs/*),Write(${DAEMON_HOME}/program.md),Write(${DAEMON_HOME}/staging/*),Write(${DAEMON_HOME}/tasks/*)" \
+    --dangerously-skip-permissions \
+    --output-format text \
+    2>/dev/null)
+meta_exit=$?
+
+# Save whatever output we got, even on failure
+if [ -n "$output" ]; then
+    echo "$output" > "$LOGS_DIR/meta/${TODAY}.md"
+fi
+
+if [ $meta_exit -ne 0 ] && [ -z "$output" ]; then
+    printf '{"ts":"%s","error":"meta-agent failed with exit %d, no output"}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$meta_exit" >> "$LOGS_DIR/errors.jsonl"
+    exit 1
+fi
+
+# Extract briefing for morning hook
+briefing=$(echo "$output" | sed -n '/### BRIEFING/,/### PROGRAM_UPDATE/p' | head -n -1 | tail -n +2)
+if [ -n "$briefing" ]; then
+    printf "# %s\n\n%s\n" "$TODAY" "$briefing" > "$LOGS_DIR/briefing.md"
+fi
+
+# Extract program update suggestion (don't auto-apply -- save for review)
+program_update=$(echo "$output" | sed -n '/### PROGRAM_UPDATE/,/### SKILL_CANDIDATES/p' | head -n -1 | tail -n +2)
+if [ -n "$program_update" ] && ! echo "$program_update" | grep -qi "NONE"; then
+    echo "$program_update" > "$LOGS_DIR/meta/program-suggestion-${TODAY}.md"
+fi
+
+printf '{"ts":"%s","action":"meta_review"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOGS_DIR/activity.jsonl"
+
+echo "Meta-review complete: $LOGS_DIR/meta/${TODAY}.md"

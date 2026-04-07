@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# cd-persist: activate/deactivate persist mode
+# Session-isolated: only the activating session gets blocked.
+set -euo pipefail
+source "$(dirname "$0")/../lib/config.sh"
+STATE_DIR="$DAEMON_HOME/state"
+mkdir -p "$STATE_DIR"
+
+GOAL_FILE="$STATE_DIR/persist-goal.md"
+LOOP_FILE="$STATE_DIR/persist-loops"
+SESSION_FILE="$STATE_DIR/persist-session"
+
+case "${1:-}" in
+    on)
+        shift
+        goal="$*"
+        [ -z "$goal" ] && { echo "Usage: cd-persist on <goal description>"; exit 1; }
+        # Atomic writes: temp file + mv
+        tmp=$(mktemp "$STATE_DIR/tmp.XXXXXX")
+        echo "$goal" > "$tmp" && mv "$tmp" "$GOAL_FILE"
+        echo "0" > "$LOOP_FILE"
+        # Store activating session ID so only this session gets blocked
+        echo "${CLAUDE_SESSION_ID:-${PPID:-any}}" > "$SESSION_FILE"
+        echo "Persist mode ON (max 10 loops): $goal"
+        echo "Session: $(cat "$SESSION_FILE")"
+        ;;
+    off)
+        rm -f "$GOAL_FILE" "$LOOP_FILE" "$SESSION_FILE"
+        echo "Persist mode OFF"
+        ;;
+    status)
+        if [ -f "$GOAL_FILE" ]; then
+            loops=$(cat "$LOOP_FILE" 2>/dev/null || echo 0)
+            sid=$(cat "$SESSION_FILE" 2>/dev/null || echo "any")
+            echo "ACTIVE ($loops/10 loops, session: $sid)"
+            echo "Goal: $(cat "$GOAL_FILE")"
+        else
+            echo "INACTIVE"
+        fi
+        ;;
+    *)
+        echo "Usage: cd-persist on|off|status"
+        ;;
+esac

@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# cd-docs-watch: Daily Claude Code docs change scanner.
+# Mounts docs as filesystem via nia-docs, diffs against yesterday's snapshot.
+# Flags new pages, removed pages, and changed content.
+# Runs via systemd timer or manually.
+set -uo pipefail
+
+source "$(dirname "$0")/../lib/config.sh"
+DOCS_DIR="$DAEMON_HOME/docs-snapshots"
+LOGS_DIR="$DAEMON_HOME/logs"
+mkdir -p "$DOCS_DIR" "$LOGS_DIR/docs"
+
+TODAY=$(date -u +%Y-%m-%d)
+SNAPSHOT_DIR="$DOCS_DIR/$TODAY"
+REPORT="$LOGS_DIR/docs/${TODAY}.md"
+
+# --- Stage 1: Snapshot today's docs ---
+echo "Snapshotting Claude Code docs..."
+mkdir -p "$SNAPSHOT_DIR"
+
+# Get file list
+npx nia-docs https://code.claude.com/docs -c "find . -name '*.md' -type f" 2>/dev/null \
+    | grep -v "^-\|^✔\|^$" | sort > "$SNAPSHOT_DIR/filelist.txt"
+
+# Snapshot ALL pages -- they're small text, no reason to cherry-pick
+while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    # Strip leading ./
+    clean="${file#./}"
+    # Create subdirs if needed (e.g. whats-new/)
+    mkdir -p "$SNAPSHOT_DIR/$(dirname "$clean")"
+    content=$(npx nia-docs https://code.claude.com/docs -c "cat $file" 2>/dev/null | grep -v "^- Loading\|^✔")
+    if [ -n "$content" ]; then
+        echo "$content" > "$SNAPSHOT_DIR/$clean"
+    fi
+done < "$SNAPSHOT_DIR/filelist.txt"
+
+echo "Snapshot saved: $SNAPSHOT_DIR ($(wc -l < "$SNAPSHOT_DIR/filelist.txt") pages)"
+
+# --- Stage 2: Diff against most recent previous snapshot ---
+prev_dir=$(ls -d "$DOCS_DIR"/2026-* 2>/dev/null | grep -v "$TODAY" | sort | tail -1)
+
+if [ -z "$prev_dir" ]; then
+    echo "# Claude Code Docs Watch - ${TODAY}" > "$REPORT"
+    echo "" >> "$REPORT"
+    echo "First snapshot. $(wc -l < "$SNAPSHOT_DIR/filelist.txt") pages captured. Diff available tomorrow." >> "$REPORT"
+    printf '{"ts":"%s","action":"docs_watch","pages":%d,"changes":"first_snapshot"}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(wc -l < "$SNAPSHOT_DIR/filelist.txt")" \
+        >> "$LOGS_DIR/activity.jsonl"
+    echo "First snapshot. Diff available tomorrow."
+    exit 0
+fi
+
+echo "Diffing against $(basename "$prev_dir")..."
+
+# New pages
+new_pages=$(comm -23 "$SNAPSHOT_DIR/filelist.txt" "$prev_dir/filelist.txt" 2>/dev/null)
+removed_pages=$(comm -13 "$SNAPSHOT_DIR/filelist.txt" "$prev_dir/filelist.txt" 2>/dev/null)
+
+# Content diffs for ALL pages
+changed_pages=""
+while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    clean="${file#./}"
+    if [ -f "$prev_dir/$clean" ] && [ -f "$SNAPSHOT_DIR/$clean" ]; then
+        if ! diff -q "$prev_dir/$clean" "$SNAPSHOT_DIR/$clean" > /dev/null 2>&1; then
+            changed_pages="${changed_pages}${clean} "
+        fi
+    fi
+done < "$SNAPSHOT_DIR/filelist.txt"
+
+# --- Stage 3: Generate report ---
+{
+    echo "# Claude Code Docs Watch - ${TODAY}"
+    echo ""
+    echo "Compared against: $(basename "$prev_dir")"
+    echo ""
+
+    if [ -n "$new_pages" ]; then
+        echo "## New Pages"
+        echo "$new_pages" | sed 's/^/- /'
+        echo ""
+    fi
+
+    if [ -n "$removed_pages" ]; then
+        echo "## Removed Pages"
+        echo "$removed_pages" | sed 's/^/- /'
+        echo ""
+    fi
+
+    if [ -n "$changed_pages" ]; then
+        echo "## Changed Pages"
+        for page in $changed_pages; do
+            echo "### $page"
+            diff --unified=3 "$prev_dir/$page" "$SNAPSHOT_DIR/$page" 2>/dev/null | head -60
+            echo ""
+        done
+    fi
+
+    if [ -z "$new_pages" ] && [ -z "$removed_pages" ] && [ -z "$changed_pages" ]; then
+        echo "No changes detected."
+    fi
+} > "$REPORT"
+
+# Count changes
+n_new=$(echo "$new_pages" | grep -c '.' || echo 0)
+n_removed=$(echo "$removed_pages" | grep -c '.' || echo 0)
+n_changed=$(echo "$changed_pages" | wc -w)
+
+printf '{"ts":"%s","action":"docs_watch","new":%d,"removed":%d,"changed":%d}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$n_new" "$n_removed" "$n_changed" \
+    >> "$LOGS_DIR/activity.jsonl"
+
+echo "Report: $REPORT ($n_new new, $n_removed removed, $n_changed changed)"

@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# cd-changelog: Scan Claude Code releases for opportunities and dead weight.
+# Compares new features against our current setup (skills, hooks, CLAUDE.md).
+# Run daily via systemd timer or as a daemon task.
+set -euo pipefail
+
+source "$(dirname "$0")/../lib/config.sh"
+LOGS_DIR="$DAEMON_HOME/logs"
+mkdir -p "$LOGS_DIR/changelog"
+
+TODAY=$(date -u +%Y-%m-%d)
+LAST_CHECK_FILE="$DAEMON_HOME/state/last-changelog-check"
+OUTPUT="$LOGS_DIR/changelog/${TODAY}.md"
+
+# Get last 3 releases
+releases=$(gh api repos/anthropics/claude-code/releases --jq '.[0:3] | .[] | "## \(.tag_name) (\(.published_at[:10]))\n\(.body)\n"' 2>/dev/null)
+
+if [ -z "$releases" ]; then
+    echo "Failed to fetch releases" >> "$LOGS_DIR/errors.jsonl"
+    exit 1
+fi
+
+# Get our current setup for comparison
+current_skills=$(find ~/.claude/skills -name "SKILL.md" -exec grep "^name:" {} \; 2>/dev/null | sed 's/name: //' | sort)
+current_hooks=$(cat ~/.claude/settings.json 2>/dev/null | jq -r '.hooks | keys[]' 2>/dev/null | sort)
+claude_md_size=$(wc -l < ~/.claude/CLAUDE.md 2>/dev/null || echo 0)
+
+# Build context for analysis
+context="## Recent Claude Code Releases
+${releases}
+
+## Our Current Setup
+Skills installed: ${current_skills}
+Hooks configured: ${current_hooks}
+CLAUDE.md size: ${claude_md_size} lines
+Daemon: claude-daemon with circuit breaker, cost tracking, self-review
+Trace collection: PostToolUse + UserPromptSubmit hooks
+Meta-agent: nightly sonnet review of session digests
+Peer messaging: claude-peers with name-based resolution (in progress)
+
+## Our Known Workarounds
+- Manual trace collection via hooks (is there a native alternative now?)
+- cd-engine wraps claude -p in bash (is there a native daemon/schedule mode?)
+- Session digest hooks (does auto-memory or auto-dream replace this?)
+- PostCompact hook for re-injecting instructions (is compaction smarter now?)
+- Effective-go skill teaching zero-value design (has the base model improved here?)
+"
+
+# Ask sonnet to analyze
+prompt="You are scanning Claude Code release notes to find:
+
+1. NEW FEATURES we should adopt (things that improve our daemon, hooks, or skills)
+2. DEAD WEIGHT to remove (our workarounds that are now native features)
+3. BREAKING CHANGES that might affect our setup
+
+${context}
+
+For each finding, write:
+- What changed in Claude Code
+- How it affects our setup (adopt / remove / watch)
+- Specific action to take
+
+Be concrete. If there's nothing actionable, say so. Don't invent opportunities."
+
+result=$(claude -p "$prompt" \
+    --model claude-haiku-4-5 \
+    --max-turns 3 \
+    --dangerously-skip-permissions \
+    --output-format text \
+    2>/dev/null) || {
+    echo "Changelog analysis failed" >> "$LOGS_DIR/errors.jsonl"
+    exit 1
+}
+
+# Save analysis
+printf "# Claude Code Changelog Analysis - %s\n\n%s\n" "$TODAY" "$result" > "$OUTPUT"
+
+# Log it
+printf '{"ts":"%s","action":"changelog_scan","releases_checked":3}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOGS_DIR/activity.jsonl"
+
+echo "$TODAY" > "$LAST_CHECK_FILE"
+echo "Changelog analysis saved: $OUTPUT"

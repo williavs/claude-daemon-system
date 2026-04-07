@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# cd-signals: Aggregate signals from all sources into a daily digest for the meta-agent.
+# Run before cd-meta so it has fresh data.
+set -uo pipefail
+# Note: not using -e because pipefail + head causes SIGPIPE (exit 141)
+# which would kill the entire script. We handle errors per-section instead.
+
+source "$(dirname "$0")/../lib/config.sh"
+SIGNALS_DIR="$LOGS_DIR/signals"
+mkdir -p "$SIGNALS_DIR"
+
+TODAY=$(date -u +%Y-%m-%d)
+SIGNAL_FILE="${SIGNALS_DIR}/${TODAY}.md"
+
+echo "# Signals - ${TODAY}" > "$SIGNAL_FILE"
+echo "" >> "$SIGNAL_FILE"
+
+# --- 1. GitHub notifications across all repos ---
+echo "## GitHub Activity" >> "$SIGNAL_FILE"
+echo "" >> "$SIGNAL_FILE"
+
+# Open PRs across personal + org
+gh search prs --author=williavs --state=open --limit=10 \
+    --json repository,number,title,createdAt \
+    --jq '.[] | "- PR \(.repository.name)#\(.number): \(.title) (\(.createdAt[:10]))"' \
+    >> "$SIGNAL_FILE" 2>/dev/null || echo "- (gh search failed)" >> "$SIGNAL_FILE"
+
+gh search prs --owner=Human-Frontier-Labs-Inc --state=open --limit=10 \
+    --json repository,number,title,createdAt \
+    --jq '.[] | "- PR HFL/\(.repository.name)#\(.number): \(.title) (\(.createdAt[:10]))"' \
+    >> "$SIGNAL_FILE" 2>/dev/null || true
+
+# Recent issues
+gh search issues --author=williavs --state=open --limit=5 \
+    --json repository,number,title \
+    --jq '.[] | "- Issue \(.repository.name)#\(.number): \(.title)"' \
+    >> "$SIGNAL_FILE" 2>/dev/null || true
+
+echo "" >> "$SIGNAL_FILE"
+
+# --- 2. Git activity across synced projects ---
+echo "## Recent Git Activity" >> "$SIGNAL_FILE"
+echo "" >> "$SIGNAL_FILE"
+
+for dir in ~/projects/claude-daemon ~/projects/effective-go-plugin ~/projects/claude-peers ~/hfl-projects/astrobot; do
+    if [ -d "$dir/.git" ]; then
+        name=$(basename "$dir")
+        recent=$(git -C "$dir" log --oneline --since="2 days ago" --format="%h %s" 2>/dev/null | head -5)
+        if [ -n "$recent" ]; then
+            echo "### $name" >> "$SIGNAL_FILE"
+            echo "$recent" | sed 's/^/- /' >> "$SIGNAL_FILE"
+            echo "" >> "$SIGNAL_FILE"
+        fi
+    fi
+done
+
+# --- 3. Fleet health trend (compare today vs last check) ---
+echo "## Fleet Health Snapshot" >> "$SIGNAL_FILE"
+echo "" >> "$SIGNAL_FILE"
+
+# SSH with 10s timeout, parallel execution -- hosts from config
+fleet_enabled=$(cfg_bool '.fleet.enabled')
+if [ "$fleet_enabled" = "true" ]; then
+signal_hosts=$(cfg '.fleet.signal_hosts | .[]?' 2>/dev/null)
+for host in $signal_hosts; do
+    (
+        echo "### $host"
+        ssh -o ConnectTimeout=10 -o BatchMode=yes "$host" \
+            "echo \"Disk: \$(df -h / | tail -1 | awk '{print \$5}')\"; echo \"Mem: \$(free -h | awk '/Mem/{print \$3\"/\"\$2}')\"; echo \"Swap: \$(free -h | awk '/Swap/{print \$3\"/\"\$2}')\"; echo \"Up: \$(uptime -p)\"" \
+            2>/dev/null || echo "(unreachable after 10s)"
+        echo ""
+    ) > "/tmp/cd-signals-${host}" &
+done
+wait
+for host in $signal_hosts; do
+    cat "/tmp/cd-signals-${host}" >> "$SIGNAL_FILE" 2>/dev/null
+    rm -f "/tmp/cd-signals-${host}"
+done
+fi # fleet_enabled
+
+# --- 4. Daemon performance ---
+echo "## Daemon Performance" >> "$SIGNAL_FILE"
+echo "" >> "$SIGNAL_FILE"
+
+if [ -f "$DAEMON_HOME/logs/cost.jsonl" ] && [ -s "$DAEMON_HOME/logs/cost.jsonl" ]; then
+    total_cost=$(jq -s 'map(.cost_usd) | add // 0' "$DAEMON_HOME/logs/cost.jsonl" 2>/dev/null)
+    total_calls=$(jq -s 'length' "$DAEMON_HOME/logs/cost.jsonl" 2>/dev/null)
+    echo "- Total cost: \$${total_cost} across ${total_calls} calls" >> "$SIGNAL_FILE"
+fi
+
+if [ -f "$DAEMON_HOME/logs/reviews.jsonl" ] && [ -s "$DAEMON_HOME/logs/reviews.jsonl" ]; then
+    avg_score=$(jq -s '[.[].review | capture("^(?<s>[0-9]+)") | .s | tonumber] | add / length' "$DAEMON_HOME/logs/reviews.jsonl" 2>/dev/null || echo "?")
+    echo "- Average self-review score: ${avg_score}/10" >> "$SIGNAL_FILE"
+fi
+
+completed=$(find "$DAEMON_HOME/tasks" -name "*.json" -exec jq -r '.status' {} \; 2>/dev/null | grep -c completed || echo 0)
+failed=$(find "$DAEMON_HOME/tasks" -name "*.json" -exec jq -r '.status' {} \; 2>/dev/null | grep -c pending || echo 0)
+echo "- Tasks: ${completed} completed, ${failed} pending" >> "$SIGNAL_FILE"
+
+echo "" >> "$SIGNAL_FILE"
+
+# --- 5. Changelog (if today's exists) ---
+if [ -f "$DAEMON_HOME/logs/changelog/${TODAY}.md" ]; then
+    echo "## Claude Code Changelog" >> "$SIGNAL_FILE"
+    cat "$DAEMON_HOME/logs/changelog/${TODAY}.md" >> "$SIGNAL_FILE"
+    echo "" >> "$SIGNAL_FILE"
+fi
+
+# --- 6. Lessons count ---
+lesson_count=$(grep -c '^###' "$DAEMON_HOME/logs/lessons.md" 2>/dev/null || echo 0)
+echo "## System State" >> "$SIGNAL_FILE"
+echo "- Lessons captured: ${lesson_count}" >> "$SIGNAL_FILE"
+echo "- Skills: $(find ~/.claude/skills -maxdepth 2 -name 'SKILL.md' 2>/dev/null | wc -l)" >> "$SIGNAL_FILE"
+echo "- CLAUDE.md: $(wc -l < ~/.claude/CLAUDE.md 2>/dev/null || echo 0) lines" >> "$SIGNAL_FILE"
+
+printf '{"ts":"%s","action":"signals_collected"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$DAEMON_HOME/logs/activity.jsonl"
+
+echo "Signals collected: $SIGNAL_FILE"

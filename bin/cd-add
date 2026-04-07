@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# cd-add: Add a task to the daemon queue
+set -euo pipefail
+
+source "$(dirname "$0")/../lib/config.sh"
+TASKS_DIR="$DAEMON_HOME/tasks"
+
+if [ $# -lt 1 ]; then
+    echo "Usage: cd-add <subject> [description] [--model haiku|sonnet|opus]"
+    exit 1
+fi
+
+subject="$1"
+description="${2:-$subject}"
+model="sonnet"
+allowed_tools="Read,Grep,Glob,Bash"
+max_turns=3
+
+# Parse flags
+for arg in "$@"; do
+    case "$arg" in
+        --model=*) model="${arg#*=}" ;;
+        --tools=*) allowed_tools="${arg#*=}" ;;
+        --turns=*) max_turns="${arg#*=}" ;;
+    esac
+done
+
+# Generate sequential ID
+last_id=$(ls "$TASKS_DIR"/task-*.json 2>/dev/null | sort | tail -1 | grep -oP 'task-\K\d+' || echo "000")
+next_id=$(printf "%03d" $((10#$last_id + 1)))
+
+task_file="$TASKS_DIR/task-${next_id}.json"
+
+cat > "$task_file" << EOF
+{
+  "id": "$next_id",
+  "subject": $(jq -n --arg s "$subject" '$s'),
+  "description": $(jq -n --arg d "$description" '$d'),
+  "status": "pending",
+  "owner": null,
+  "model": "$model",
+  "allowed_tools": "$allowed_tools",
+  "max_turns": $max_turns,
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "completed_at": null,
+  "result": null,
+  "tokens_used": 0,
+  "cost_usd": 0,
+  "attempts": 0,
+  "max_attempts": 3
+}
+EOF
+
+echo "Task #${next_id} added: $subject"

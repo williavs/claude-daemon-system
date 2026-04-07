@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# cd-logs: Tail activity, cost, or error logs
+set -euo pipefail
+
+source "$(dirname "$0")/../lib/config.sh"
+
+log_type="${1:-activity}"
+
+case "$log_type" in
+    activity|a) tail -f "$DAEMON_HOME/logs/activity.jsonl" | jq -r '"\(.ts | split("T")[1] | split("Z")[0])  \(.action)  \(.task_id // "")"' ;;
+    cost|c)     tail -f "$DAEMON_HOME/logs/cost.jsonl" | jq -r '"\(.ts | split("T")[1] | split("Z")[0])  \(.model)  \(.tokens_in + .tokens_out)tok  $\(.cost_usd)"' ;;
+    errors|e)   tail -f "$DAEMON_HOME/logs/errors.jsonl" | jq -r '"\(.ts | split("T")[1] | split("Z")[0])  task-\(.task_id)  \(.message)"' ;;
+    lessons|l)  cat "$DAEMON_HOME/logs/lessons.md" ;;
+    daemon|d)   tail -f "$DAEMON_HOME/logs/daemon.log" ;;
+    *)          echo "Usage: cd-logs [activity|cost|errors|lessons|daemon]" ;;
+esac

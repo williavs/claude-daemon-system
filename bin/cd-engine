@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+# cd-engine: Core daemon loop. Polls tasks, runs claude -p, tracks everything.
+set -euo pipefail
+
+source "$(dirname "$0")/../lib/config.sh"
+INBOX_DIR="$DAEMON_HOME/inbox"
+
+# Load config values
+POLL_INTERVAL=$(cfg '.poll_interval // 30')
+MAX_TOKENS=$(cfg '.max_tokens_per_hour // 200000')
+MAX_CALLS=$(cfg '.max_calls_per_hour // 20')
+CB_THRESHOLD=$(cfg '.cb_no_progress_threshold // 3')
+CB_COOLDOWN=$(cfg '.cb_cooldown_minutes // 30')
+DEFAULT_MODEL=$(cfg '.default_model // "sonnet"')
+MAX_ATTEMPTS=$(cfg '.max_task_attempts // 3')
+
+# --- Logging ---
+log_activity() {
+    local action="$1"; shift
+    printf '{"ts":"%s","action":"%s"%s}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$action" "$*" \
+        >> "$LOGS_DIR/activity.jsonl"
+}
+
+log_cost() {
+    local model="$1" tokens_in="$2" tokens_out="$3" cost="$4"
+    printf '{"ts":"%s","model":"%s","tokens_in":%d,"tokens_out":%d,"cost_usd":%.6f}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$model" "$tokens_in" "$tokens_out" "$cost" \
+        >> "$LOGS_DIR/cost.jsonl"
+}
+
+log_error() {
+    local task_id="$1" message="$2"
+    printf '{"ts":"%s","task_id":"%s","message":"%s"}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$task_id" "$message" \
+        >> "$LOGS_DIR/errors.jsonl"
+}
+
+# --- Circuit Breaker ---
+cb_init() {
+    [ -f "$STATE_DIR/circuit.json" ] && return
+    printf '{"state":"CLOSED","consecutive_failures":0,"total_opens":0,"opened_at":null}\n' \
+        > "$STATE_DIR/circuit.json"
+}
+
+cb_state() {
+    jq -r '.state' "$STATE_DIR/circuit.json"
+}
+
+cb_check() {
+    local state
+    state=$(cb_state)
+    if [ "$state" = "OPEN" ]; then
+        local opened_at cooldown_end now
+        opened_at=$(jq -r '.opened_at' "$STATE_DIR/circuit.json")
+        cooldown_end=$(date -d "$opened_at + $CB_COOLDOWN minutes" +%s 2>/dev/null || echo 0)
+        now=$(date +%s)
+        if [ "$now" -ge "$cooldown_end" ]; then
+            # Transition to HALF_OPEN
+            jq '.state = "HALF_OPEN"' "$STATE_DIR/circuit.json" > "$STATE_DIR/circuit.tmp" \
+                && mv "$STATE_DIR/circuit.tmp" "$STATE_DIR/circuit.json"
+            log_activity "circuit_half_open"
+            return 0 # allow one attempt
+        fi
+        return 1 # still cooling down
+    fi
+    return 0 # CLOSED or HALF_OPEN, allow
+}
+
+cb_success() {
+    jq '.state = "CLOSED" | .consecutive_failures = 0' \
+        "$STATE_DIR/circuit.json" > "$STATE_DIR/circuit.tmp" \
+        && mv "$STATE_DIR/circuit.tmp" "$STATE_DIR/circuit.json"
+}
+
+cb_failure() {
+    local failures
+    failures=$(jq '.consecutive_failures + 1' "$STATE_DIR/circuit.json")
+    if [ "$failures" -ge "$CB_THRESHOLD" ]; then
+        jq --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '.state = "OPEN" | .consecutive_failures = '"$failures"' | .total_opens += 1 | .opened_at = $ts' \
+            "$STATE_DIR/circuit.json" > "$STATE_DIR/circuit.tmp" \
+            && mv "$STATE_DIR/circuit.tmp" "$STATE_DIR/circuit.json"
+        log_activity "circuit_open" ',"failures":'"$failures"
+    else
+        jq '.consecutive_failures = '"$failures" \
+            "$STATE_DIR/circuit.json" > "$STATE_DIR/circuit.tmp" \
+            && mv "$STATE_DIR/circuit.tmp" "$STATE_DIR/circuit.json"
+    fi
+}
+
+# --- Token Budget ---
+budget_init() {
+    [ -f "$STATE_DIR/budget.json" ] && return
+    printf '{"hour":"%s","tokens_used":0,"calls_made":0}\n' \
+        "$(date -u +%Y-%m-%dT%H:00:00Z)" > "$STATE_DIR/budget.json"
+}
+
+budget_check() {
+    local current_hour budget_hour tokens calls
+    current_hour=$(date -u +%Y-%m-%dT%H:00:00Z)
+    budget_hour=$(jq -r '.hour' "$STATE_DIR/budget.json")
+
+    # Reset on new hour
+    if [ "$current_hour" != "$budget_hour" ]; then
+        printf '{"hour":"%s","tokens_used":0,"calls_made":0}\n' "$current_hour" \
+            > "$STATE_DIR/budget.json"
+        return 0
+    fi
+
+    tokens=$(jq '.tokens_used' "$STATE_DIR/budget.json")
+    calls=$(jq '.calls_made' "$STATE_DIR/budget.json")
+
+    if [ "$tokens" -ge "$MAX_TOKENS" ] || [ "$calls" -ge "$MAX_CALLS" ]; then
+        return 1 # budget exhausted
+    fi
+    return 0
+}
+
+budget_record() {
+    local tokens="$1"
+    jq '.tokens_used += '"$tokens"' | .calls_made += 1' \
+        "$STATE_DIR/budget.json" > "$STATE_DIR/budget.tmp" \
+        && mv "$STATE_DIR/budget.tmp" "$STATE_DIR/budget.json"
+}
+
+# --- Task Management ---
+find_unclaimed_task() {
+    for f in "$TASKS_DIR"/task-*.json; do
+        [ -f "$f" ] || continue
+        local status owner attempts max
+        status=$(jq -r '.status' "$f")
+        owner=$(jq -r '.owner // empty' "$f")
+        attempts=$(jq '.attempts // 0' "$f")
+        max=$(jq '.max_attempts // '"$MAX_ATTEMPTS" "$f")
+        if [ "$status" = "pending" ] && [ -z "$owner" ] && [ "$attempts" -lt "$max" ]; then
+            basename "$f" .json | sed 's/task-//'
+            return 0
+        fi
+    done
+    return 1
+}
+
+claim_task() {
+    local task_id="$1"
+    local task_file="$TASKS_DIR/task-${task_id}.json"
+    jq --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '.status = "in_progress" | .owner = "daemon" | .started_at = $ts | .attempts += 1' \
+        "$task_file" > "$task_file.tmp" && mv "$task_file.tmp" "$task_file"
+    log_activity "claim_task" ',"task_id":"'"$task_id"'"'
+}
+
+complete_task() {
+    local task_id="$1" result="$2" tokens="$3" cost="$4"
+    local task_file="$TASKS_DIR/task-${task_id}.json"
+    # Write result to temp file, then use jq --rawfile to read it.
+    # jq --arg silently fails on strings >128KB (ARG_MAX), losing the result.
+    local result_tmp
+    result_tmp=$(mktemp)
+    printf '%s' "$result" > "$result_tmp"
+    jq --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --rawfile result "$result_tmp" \
+        --argjson tokens "$tokens" \
+        --argjson cost "$cost" \
+        '.status = "completed" | .completed_at = $ts | .result = $result | .tokens_used = $tokens | .cost_usd = $cost' \
+        "$task_file" > "$task_file.tmp" && mv "$task_file.tmp" "$task_file"
+    rm -f "$result_tmp"
+    log_activity "task_complete" ',"task_id":"'"$task_id"'","tokens":'"$tokens"',"cost":'"$cost"
+}
+
+fail_task() {
+    local task_id="$1" error="$2"
+    local task_file="$TASKS_DIR/task-${task_id}.json"
+    jq --arg err "$error" \
+        '.status = "pending" | .owner = null | .last_error = $err' \
+        "$task_file" > "$task_file.tmp" && mv "$task_file.tmp" "$task_file"
+    log_activity "task_failed" ',"task_id":"'"$task_id"'"'
+    log_error "$task_id" "$error"
+}
+
+# --- Run Claude ---
+run_task() {
+    local task_id="$1"
+    local task_file="$TASKS_DIR/task-${task_id}.json"
+    local subject description model lessons_context prompt
+
+    subject=$(jq -r '.subject' "$task_file")
+    description=$(jq -r '.description' "$task_file")
+    model=$(jq -r '.model // "'"$DEFAULT_MODEL"'"' "$task_file")
+
+    # Build prompt -- only inject what the model needs for THIS task.
+    # Haiku tasks get minimal context. Sonnet/opus get full program.md.
+    local program_context=""
+    if [ "$model" != "haiku" ] && [ -f "$DAEMON_HOME/program.md" ]; then
+        program_context="$(cat "$DAEMON_HOME/program.md")
+
+---
+
+"
+    elif [ -f "$DAEMON_HOME/program.md" ]; then
+        # Haiku gets decision rules + output quality example
+        program_context="You are a headless agent. Be concise. Never ask questions. Report findings with actual data.
+
+Example of GOOD output: 'Disk: 59% (260G/466G) -- healthy. Swap: 10% (808Mi/8Gi) -- recovered. [ACTION REQUIRED] server3 unreachable (SSH timeout 10s).'
+Example of BAD output: 'The system appears to be in a healthy state overall.' (no numbers, no evidence)
+
+"
+    fi
+
+    # Lessons: only include relevant ones (last 5, not 30)
+    local lessons_context=""
+    if [ -s "$LOGS_DIR/lessons.md" ]; then
+        lessons_context="
+
+Avoid these known issues:
+$(tail -10 "$LOGS_DIR/lessons.md" | grep "^- What:" | head -5)"
+    fi
+
+    prompt="${program_context}Task: ${subject}
+
+${description}${lessons_context}"
+
+    log_activity "run_claude" ',"task_id":"'"$task_id"'","model":"'"$model"'"'
+
+    local start_time output exit_code
+    start_time=$(date +%s%N)
+
+    # Map model shortnames to actual model IDs
+    local model_id
+    case "$model" in
+        haiku)  model_id="claude-haiku-4-5" ;;
+        sonnet) model_id="claude-sonnet-4-6" ;;
+        opus)   model_id="claude-opus-4-6" ;;
+        *)      model_id="$model" ;; # allow passing full ID directly
+    esac
+
+    # Per-task tool restrictions (default: read-only + bash for commands)
+    local allowed_tools max_turns
+    allowed_tools=$(jq -r '.allowed_tools // "Read,Grep,Glob,Bash"' "$task_file")
+    max_turns=$(jq -r '.max_turns // 5' "$task_file")
+
+    # Run claude -p with task-scoped permissions
+    output=$(claude -p "$prompt" \
+        --model "$model_id" \
+        --max-turns "$max_turns" \
+        --output-format json \
+        --allowedTools "$allowed_tools" \
+        --dangerously-skip-permissions \
+        2>/dev/null) || exit_code=$?
+
+    local end_time duration_ms tokens_in tokens_out total_tokens cost
+    end_time=$(date +%s%N)
+    duration_ms=$(( (end_time - start_time) / 1000000 ))
+
+    # Extract token usage from JSON output
+    tokens_in=$(echo "$output" | jq '.usage.input_tokens // 0' 2>/dev/null || echo 0)
+    tokens_out=$(echo "$output" | jq '.usage.output_tokens // 0' 2>/dev/null || echo 0)
+    total_tokens=$((tokens_in + tokens_out))
+
+    # Calculate cost (approximate, using python3 since bc isn't on Arch)
+    case "$model" in
+        haiku)  cost=$(python3 -c "print(f'{$tokens_in * 0.0000008 + $tokens_out * 0.000004:.6f}')") ;;
+        sonnet) cost=$(python3 -c "print(f'{$tokens_in * 0.000003 + $tokens_out * 0.000015:.6f}')") ;;
+        opus)   cost=$(python3 -c "print(f'{$tokens_in * 0.000015 + $tokens_out * 0.000075:.6f}')") ;;
+        *)      cost=0 ;;
+    esac
+
+    # Record to budget
+    budget_record "$total_tokens"
+    log_cost "$model" "$tokens_in" "$tokens_out" "$cost"
+
+    # Extract the text result -- no truncation at capture time.
+    # Store full result in task file. Only truncate for self-review input.
+    local result_text
+    result_text=$(echo "$output" | jq -r '.result // .content // "no output"' 2>/dev/null)
+
+    if [ "${exit_code:-0}" -eq 0 ] && [ -n "$result_text" ] && [ "$result_text" != "no output" ]; then
+        complete_task "$task_id" "$result_text" "$total_tokens" "$cost"
+        cb_success
+
+        # Self-review: haiku scores the output (cheap feedback loop)
+        if budget_check; then
+            local review_input review_prompt review
+            review_input=$(echo "$result_text" | head -c 5000)
+            review_prompt="Rate this task result 0-10. Your review MUST be under 180 characters. Format: 'N/10 -- what worked, what's missing.'
+
+Task: ${subject}
+Result: ${review_input}"
+            review=$(claude -p "$review_prompt" \
+                --model claude-haiku-4-5 \
+                --max-turns 2 \
+                --output-format text \
+                --dangerously-skip-permissions \
+                2>/dev/null) || true
+            if [ -n "$review" ]; then
+                # Use jq for safe JSON encoding -- no manual escaping
+                jq -n \
+                    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                    --arg task_id "$task_id" \
+                    --arg subject "$subject" \
+                    --arg review "$(echo "$review" | head -c 300 | tr '\n' ' ')" \
+                    '{ts: $ts, task_id: $task_id, subject: $subject, review: $review}' \
+                    >> "$LOGS_DIR/reviews.jsonl"
+                budget_record 500  # approximate haiku review cost
+            fi
+        fi
+
+        return 0
+    else
+        local error_msg="${result_text:-claude exited with code ${exit_code:-unknown}}"
+        fail_task "$task_id" "$error_msg"
+        cb_failure
+
+        # Capture lesson (use jq for safe encoding)
+        printf '\n### %s | task-%s: %s\n- What: %s\n- Attempts: %d\n\n' \
+            "$(date +%Y-%m-%d)" "$task_id" "$subject" \
+            "$(echo "$error_msg" | head -c 200)" \
+            "$(jq '.attempts' "$task_file")" \
+            >> "$LOGS_DIR/lessons.md"
+
+        return 1
+    fi
+}
+
+# --- Main Loop ---
+DRY_RUN=false
+for arg in "$@"; do
+    case "$arg" in --dry-run) DRY_RUN=true ;; esac
+done
+
+main() {
+    echo "Claude Daemon starting... $([ "$DRY_RUN" = true ] && echo '[DRY RUN]' || echo '')"
+    echo "  Poll interval: ${POLL_INTERVAL}s"
+    echo "  Token budget: ${MAX_TOKENS}/hr"
+    echo "  Call budget: ${MAX_CALLS}/hr"
+    echo "  Circuit breaker threshold: ${CB_THRESHOLD} failures"
+    echo "  Default model: ${DEFAULT_MODEL}"
+    echo ""
+
+    cb_init
+    budget_init
+    log_activity "daemon_start"
+
+    # Write PID for cd-stop
+    echo $$ > "$STATE_DIR/daemon.pid"
+
+    trap 'log_activity "daemon_stop"; rm -f "$STATE_DIR/daemon.pid"; echo "Daemon stopped."; exit 0' INT TERM
+
+    while true; do
+        # 1. Circuit breaker check
+        if ! cb_check; then
+            sleep "$POLL_INTERVAL"
+            continue
+        fi
+
+        # 2. Budget check
+        if ! budget_check; then
+            sleep "$POLL_INTERVAL"
+            continue
+        fi
+
+        # 3. Find and claim a task
+        local task_id
+        if task_id=$(find_unclaimed_task); then
+            claim_task "$task_id"
+            run_task "$task_id" || true
+        fi
+
+        # 4. Sleep until next poll
+        sleep "$POLL_INTERVAL"
+    done
+}
+
+main "$@"

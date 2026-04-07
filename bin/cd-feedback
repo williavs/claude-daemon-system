@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# cd-feedback: Rate today's idea so the scanner learns
+# Usage: cd-feedback fire|good|meh|dead|already-built "reason"
+set -euo pipefail
+
+source "$(dirname "$0")/../lib/config.sh"
+FEEDBACK_FILE="$DAEMON_HOME/logs/scans/feedback.jsonl"
+TODAY=$(date -u +%Y-%m-%d)
+SCAN_FILE="$DAEMON_HOME/logs/scans/${TODAY}.md"
+
+if [ $# -lt 1 ]; then
+    echo "Usage: cd-feedback fire|good|meh|dead|already-built [reason]"
+    echo ""
+    if [ -f "$SCAN_FILE" ]; then
+        idea=$(grep '^\*\*' "$SCAN_FILE" | head -1 | sed 's/\*\*//g' | cut -d- -f1 | xargs)
+        echo "Today's idea: $idea"
+    fi
+    exit 1
+fi
+
+verdict="$1"
+reason="${2:-no reason given}"
+
+# Get today's idea name
+idea="unknown"
+if [ -f "$SCAN_FILE" ]; then
+    idea=$(grep '^\*\*' "$SCAN_FILE" | head -1 | sed 's/\*\*//g' | cut -d- -f1 | xargs)
+fi
+
+jq -n --arg date "$TODAY" --arg idea "$idea" --arg verdict "$verdict" --arg reason "$reason" \
+    '{date: $date, idea: $idea, verdict: $verdict, reason: $reason}' \
+    >> "$FEEDBACK_FILE"
+
+echo "Recorded: $idea [$verdict] -- $reason"

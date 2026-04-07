@@ -1,0 +1,16 @@
+# Runtime data -- never commit (contains hostnames, prompts, fleet details)
+logs/
+traces/
+prompts/
+tasks/
+state/
+staging/
+inbox/
+docs-snapshots/
+excalidraw.log
+
+# Config with real email, fleet hosts, API details -- use config.template.json
+config.json
+
+# program.md has your specific fleet names and lessons -- use program.template.md
+program.md

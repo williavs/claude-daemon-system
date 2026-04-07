@@ -1,0 +1,35 @@
+{
+  "poll_interval": 30,
+  "max_tokens_per_hour": 200000,
+  "max_calls_per_hour": 20,
+  "cb_no_progress_threshold": 3,
+  "cb_cooldown_minutes": 30,
+  "default_model": "sonnet",
+  "triage_model": "haiku",
+  "max_task_attempts": 3,
+
+  "email": {
+    "recipients": "you@example.com",
+    "send_command": "resend-email -m \"$BODY\" \"$RECIPIENTS\" \"$SUBJECT\""
+  },
+
+  "searxng": {
+    "enabled": false,
+    "url": "http://localhost:8889",
+    "ssh_host": ""
+  },
+
+  "fleet": {
+    "enabled": false,
+    "health_dest": "your-homelab-hostname",
+    "signal_hosts": [],
+    "machines": {}
+  },
+
+  "scan": {
+    "enabled": true,
+    "model": "claude-opus-4-6",
+    "max_budget_usd": 2.00,
+    "max_turns": 10
+  }
+}

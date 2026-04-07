@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# cd-setup: Interactive installer for claude-daemon.
+# Creates config.json, installs hooks, sets up systemd timers.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DAEMON_HOME="${CLAUDE_DAEMON_HOME:-$HOME/.claude-daemon}"
+
+echo "Claude Daemon Setup"
+echo "==================="
+echo ""
+
+# --- Step 1: Create daemon home ---
+if [ -L "$DAEMON_HOME" ] || [ -d "$DAEMON_HOME" ]; then
+    echo "Daemon home exists: $DAEMON_HOME"
+else
+    echo "Creating symlink: $DAEMON_HOME -> $SCRIPT_DIR"
+    ln -s "$SCRIPT_DIR" "$DAEMON_HOME"
+fi
+
+mkdir -p "$DAEMON_HOME/tasks" "$DAEMON_HOME/logs" "$DAEMON_HOME/state" \
+         "$DAEMON_HOME/traces" "$DAEMON_HOME/prompts" "$DAEMON_HOME/staging"
+
+# --- Step 2: Config ---
+CONFIG="$DAEMON_HOME/config.json"
+if [ -f "$CONFIG" ]; then
+    echo "Config exists: $CONFIG"
+else
+    cp "$SCRIPT_DIR/config.template.json" "$CONFIG"
+    echo "Created config from template: $CONFIG"
+    echo "  Edit this file to set your email, fleet hosts, etc."
+fi
+
+# --- Step 3: Add bin/ to PATH ---
+if ! echo "$PATH" | grep -q "$SCRIPT_DIR/bin"; then
+    echo ""
+    echo "Add to your shell profile:"
+    echo "  export PATH=\"$SCRIPT_DIR/bin:\$PATH\""
+    echo "  export CLAUDE_DAEMON_HOME=\"$DAEMON_HOME\""
+fi
+
+# --- Step 4: Install hooks ---
+echo ""
+echo "Hook Installation"
+echo "-----------------"
+echo "Hooks need absolute paths in ~/.claude/settings.json."
+echo ""
+
+HOOKS_DIR="$SCRIPT_DIR/hooks"
+SETTINGS="$HOME/.claude/settings.json"
+
+if [ ! -f "$SETTINGS" ]; then
+    echo "No ~/.claude/settings.json found. Create it first, then re-run."
+    exit 0
+fi
+
+echo "Available hooks (from $HOOKS_DIR):"
+for h in "$HOOKS_DIR"/*.sh; do
+    name=$(basename "$h" .sh)
+    desc=$(head -2 "$h" | tail -1 | sed 's/^# //')
+    echo "  $name: $desc"
+done
+
+echo ""
+echo "To install hooks, add them to $SETTINGS under the 'hooks' key."
+echo "Use this path prefix: $HOOKS_DIR/"
+echo ""
+echo "Example for persist-stop.sh:"
+echo '  "Stop": [{"hooks": [{"type": "command", "command": "'$HOOKS_DIR'/persist-stop.sh"}]}]'
+
+# --- Step 5: Systemd timers (Linux only) ---
+if command -v systemctl &>/dev/null; then
+    echo ""
+    echo "Systemd Timers"
+    echo "--------------"
+    echo "Install nightly pipeline? (enroll 2:55am, meta 3:00am, docs 5:30am, changelog 6:00am, scan 7:30am)"
+    read -p "Install timers? [y/N] " -r
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        mkdir -p ~/.config/systemd/user
+
+        for timer_name in enroll:02:55 meta:03:00 docs:05:30 changelog:06:00 scan:07:30; do
+            name="${timer_name%%:*}"
+            time="${timer_name#*:}"
+
+            cat > ~/.config/systemd/user/claude-daemon-${name}.service << EOF
+[Unit]
+Description=Claude Daemon: $name
+
+[Service]
+Type=oneshot
+ExecStart=$SCRIPT_DIR/bin/cd-${name == "docs" && echo "docs-watch" || echo "$name"}
+Environment=HOME=$HOME
+Environment=PATH=$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+Environment=CLAUDE_DAEMON_HOME=$DAEMON_HOME
+EOF
+
+            cat > ~/.config/systemd/user/claude-daemon-${name}.timer << EOF
+[Unit]
+Description=Claude Daemon: $name timer
+
+[Timer]
+OnCalendar=*-*-* ${time}:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+            echo "  Created: claude-daemon-${name}.timer (${time})"
+        done
+
+        systemctl --user daemon-reload
+        for timer_name in enroll meta docs changelog scan; do
+            systemctl --user enable claude-daemon-${timer_name}.timer 2>/dev/null
+        done
+        systemctl --user start claude-daemon-{enroll,meta,docs,changelog,scan}.timer 2>/dev/null || true
+        echo "Timers installed and started."
+    fi
+fi
+
+echo ""
+echo "Setup complete."
+echo "  Config: $CONFIG"
+echo "  Commands: $SCRIPT_DIR/bin/cd-*"
+echo "  Run 'cd-status' to verify."
