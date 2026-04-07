@@ -73,12 +73,12 @@ if command -v systemctl &>/dev/null; then
     echo ""
     echo "Systemd Timers"
     echo "--------------"
-    echo "Install nightly pipeline? (enroll 2:55am, meta 3:00am, docs 5:30am, changelog 6:00am, scan 7:30am)"
+    echo "Install nightly pipeline? (meta 3:00am, docs 5:30am, changelog 6:00am, scan 7:30am)"
     read -p "Install timers? [y/N] " -r
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         mkdir -p ~/.config/systemd/user
 
-        for timer_name in enroll:02:55 meta:03:00 docs:05:30 changelog:06:00 scan:07:30; do
+        for timer_name in meta:03:00 docs:05:30 changelog:06:00 scan:07:30; do
             name="${timer_name%%:*}"
             time="${timer_name#*:}"
 
@@ -109,10 +109,10 @@ EOF
         done
 
         systemctl --user daemon-reload
-        for timer_name in enroll meta docs changelog scan; do
+        for timer_name in meta docs changelog scan; do
             systemctl --user enable claude-daemon-${timer_name}.timer 2>/dev/null
         done
-        systemctl --user start claude-daemon-{enroll,meta,docs,changelog,scan}.timer 2>/dev/null || true
+        systemctl --user start claude-daemon-{meta,docs,changelog,scan}.timer 2>/dev/null || true
         echo "Timers installed and started."
     fi
 fi
