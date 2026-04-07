@@ -1,36 +1,144 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
-  <!-- Background circle -->
-  <circle cx="100" cy="100" r="95" fill="#1a1a2e" stroke="#e94560" stroke-width="2"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400">
+  <defs>
+    <!-- Glow effect -->
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="glow-strong">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <!-- Circuit trace pattern -->
+    <pattern id="circuit" patternUnits="userSpaceOnUse" width="40" height="40">
+      <path d="M0 20h15l5-5h5l5 5h10" stroke="#1a2744" stroke-width="0.5" fill="none"/>
+      <path d="M20 0v15l-5 5v5l5 5v10" stroke="#1a2744" stroke-width="0.5" fill="none"/>
+      <circle cx="20" cy="20" r="1" fill="#1a2744"/>
+    </pattern>
+    <!-- Gradient for the skull -->
+    <radialGradient id="skull-grad" cx="50%" cy="40%" r="55%">
+      <stop offset="0%" stop-color="#2a1f4e"/>
+      <stop offset="100%" stop-color="#0d0d1a"/>
+    </radialGradient>
+    <linearGradient id="horn-grad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ff2e63"/>
+      <stop offset="100%" stop-color="#7b2d8e"/>
+    </linearGradient>
+    <!-- Scanline effect -->
+    <pattern id="scanlines" patternUnits="userSpaceOnUse" width="4" height="4">
+      <line x1="0" y1="0" x2="4" y2="0" stroke="rgba(255,255,255,0.02)" stroke-width="1"/>
+    </pattern>
+  </defs>
 
-  <!-- Daemon horns -->
-  <path d="M60 75 Q50 40 40 55 Q45 65 55 72" fill="#e94560" opacity="0.9"/>
-  <path d="M140 75 Q150 40 160 55 Q155 65 145 72" fill="#e94560" opacity="0.9"/>
+  <!-- Background -->
+  <rect width="400" height="400" rx="40" fill="#0a0a14"/>
+  <rect width="400" height="400" rx="40" fill="url(#circuit)" opacity="0.6"/>
 
-  <!-- Face/skull shape -->
-  <ellipse cx="100" cy="100" rx="45" ry="42" fill="#16213e" stroke="#0f3460" stroke-width="1.5"/>
+  <!-- Outer ring - data orbit -->
+  <circle cx="200" cy="200" r="170" fill="none" stroke="#1a1a3e" stroke-width="1" stroke-dasharray="4 8"/>
+  <circle cx="200" cy="200" r="150" fill="none" stroke="#1a1a3e" stroke-width="0.5" stroke-dasharray="2 12"/>
 
-  <!-- Eyes - terminal cursors blinking -->
-  <rect x="75" y="88" width="16" height="20" rx="2" fill="#0f3460"/>
-  <rect x="109" y="88" width="16" height="20" rx="2" fill="#0f3460"/>
-  <!-- Cursor blinks -->
-  <rect x="78" y="91" width="3" height="14" fill="#e94560">
-    <animate attributeName="opacity" values="1;0;1" dur="1.2s" repeatCount="indefinite"/>
-  </rect>
-  <rect x="119" y="91" width="3" height="14" fill="#e94560">
-    <animate attributeName="opacity" values="1;0;1" dur="1.2s" repeatCount="indefinite" begin="0.6s"/>
-  </rect>
+  <!-- Orbiting data packets -->
+  <g filter="url(#glow)">
+    <circle r="5" fill="#ff2e63">
+      <animateMotion dur="12s" repeatCount="indefinite" path="M200,30 A170,170 0 1,1 199.9,30"/>
+    </circle>
+    <circle r="3" fill="#08d9d6">
+      <animateMotion dur="12s" repeatCount="indefinite" begin="-4s" path="M200,30 A170,170 0 1,1 199.9,30"/>
+    </circle>
+    <circle r="4" fill="#7b2d8e">
+      <animateMotion dur="12s" repeatCount="indefinite" begin="-8s" path="M200,30 A170,170 0 1,1 199.9,30"/>
+    </circle>
+  </g>
 
-  <!-- Mouth - command prompt -->
-  <text x="100" y="130" text-anchor="middle" fill="#e94560" font-family="monospace" font-size="14" font-weight="bold">$ _</text>
-
-  <!-- Orbiting data nodes -->
-  <circle cx="100" cy="20" r="4" fill="#533483">
-    <animateTransform attributeName="transform" type="rotate" from="0 100 100" to="360 100 100" dur="8s" repeatCount="indefinite"/>
+  <!-- Inner ring pulse -->
+  <circle cx="200" cy="200" r="120" fill="none" stroke="#ff2e63" stroke-width="0.5" opacity="0.3">
+    <animate attributeName="r" values="115;125;115" dur="4s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0.3;0.1;0.3" dur="4s" repeatCount="indefinite"/>
   </circle>
-  <circle cx="180" cy="100" r="3" fill="#e94560">
-    <animateTransform attributeName="transform" type="rotate" from="120 100 100" to="480 100 100" dur="8s" repeatCount="indefinite"/>
-  </circle>
-  <circle cx="100" cy="180" r="3.5" fill="#0f3460">
-    <animateTransform attributeName="transform" type="rotate" from="240 100 100" to="600 100 100" dur="8s" repeatCount="indefinite"/>
-  </circle>
+
+  <!-- SKULL -->
+  <g transform="translate(200,195)">
+    <!-- Skull shape -->
+    <path d="M0-80 C-55-80 -85-45 -85 0 C-85 35 -70 60 -45 75 L-35 80 C-25 85 -15 82 -10 78 L0 85 L10 78 C15 82 25 85 35 80 L45 75 C70 60 85 35 85 0 C85-45 55-80 0-80Z"
+          fill="url(#skull-grad)" stroke="#2d1b69" stroke-width="1.5"/>
+
+    <!-- Forehead ridge -->
+    <path d="M-50-55 Q0-70 50-55" fill="none" stroke="#3d2b79" stroke-width="1" opacity="0.5"/>
+
+    <!-- Left eye socket -->
+    <g transform="translate(-30,-15)">
+      <path d="M-22-12 Q-22-22 -12-22 L12-22 Q22-22 22-12 L22 8 Q22 18 12 18 L-12 18 Q-22 18 -22 8Z"
+            fill="#050510" stroke="#1a0a3e" stroke-width="1"/>
+      <!-- Terminal content -->
+      <text x="-14" y="-4" fill="#08d9d6" font-family="monospace" font-size="8" opacity="0.8">
+        <animate attributeName="opacity" values="0.8;0.4;0.8" dur="3s" repeatCount="indefinite"/>
+        &gt;_
+      </text>
+      <!-- Scan line in eye -->
+      <line x1="-18" y1="0" x2="18" y2="0" stroke="#ff2e63" stroke-width="0.5" opacity="0">
+        <animate attributeName="y1" values="-18;14;-18" dur="2.5s" repeatCount="indefinite"/>
+        <animate attributeName="y2" values="-18;14;-18" dur="2.5s" repeatCount="indefinite"/>
+        <animate attributeName="opacity" values="0;0.6;0" dur="2.5s" repeatCount="indefinite"/>
+      </line>
+    </g>
+
+    <!-- Right eye socket -->
+    <g transform="translate(30,-15)">
+      <path d="M-22-12 Q-22-22 -12-22 L12-22 Q22-22 22-12 L22 8 Q22 18 12 18 L-12 18 Q-22 18 -22 8Z"
+            fill="#050510" stroke="#1a0a3e" stroke-width="1"/>
+      <text x="-14" y="6" fill="#08d9d6" font-family="monospace" font-size="7" opacity="0.6">
+        <animate attributeName="opacity" values="0.6;0.3;0.6" dur="2s" repeatCount="indefinite" begin="0.5s"/>
+        0x3F
+      </text>
+      <line x1="-18" y1="0" x2="18" y2="0" stroke="#ff2e63" stroke-width="0.5" opacity="0">
+        <animate attributeName="y1" values="14;-18;14" dur="2.5s" repeatCount="indefinite"/>
+        <animate attributeName="y2" values="14;-18;14" dur="2.5s" repeatCount="indefinite"/>
+        <animate attributeName="opacity" values="0;0.6;0" dur="2.5s" repeatCount="indefinite"/>
+      </line>
+    </g>
+
+    <!-- Nose cavity -->
+    <path d="M-6 15 L0 25 L6 15" fill="#0a0515" stroke="#1a0a3e" stroke-width="0.8"/>
+
+    <!-- Teeth / terminal output -->
+    <g transform="translate(0,42)">
+      <rect x="-30" y="-5" width="60" height="20" rx="3" fill="#050510" stroke="#1a0a3e" stroke-width="0.8"/>
+      <text x="-22" y="8" fill="#ff2e63" font-family="monospace" font-size="9" filter="url(#glow)">
+        <animate attributeName="opacity" values="1;0.5;1" dur="1s" repeatCount="indefinite"/>
+        $ claude -p
+      </text>
+    </g>
+
+    <!-- Horns -->
+    <path d="M-45-65 Q-75-120 -55-140 Q-45-125 -40-95 Q-42-80 -45-65Z" fill="url(#horn-grad)" filter="url(#glow)"/>
+    <path d="M45-65 Q75-120 55-140 Q45-125 40-95 Q42-80 45-65Z" fill="url(#horn-grad)" filter="url(#glow)"/>
+
+    <!-- Horn glow tips -->
+    <circle cx="-55" cy="-138" r="3" fill="#ff2e63" opacity="0.6">
+      <animate attributeName="opacity" values="0.6;0.2;0.6" dur="2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="55" cy="-138" r="3" fill="#ff2e63" opacity="0.6">
+      <animate attributeName="opacity" values="0.6;0.2;0.6" dur="2s" repeatCount="indefinite" begin="1s"/>
+    </circle>
+  </g>
+
+  <!-- Floating code fragments -->
+  <text x="50" y="100" fill="#08d9d6" font-family="monospace" font-size="7" opacity="0.15"
+        transform="rotate(-15 50 100)">traces.jsonl</text>
+  <text x="290" y="90" fill="#ff2e63" font-family="monospace" font-size="7" opacity="0.15"
+        transform="rotate(10 290 90)">lessons.md</text>
+  <text x="40" y="310" fill="#7b2d8e" font-family="monospace" font-size="7" opacity="0.15"
+        transform="rotate(5 40 310)">program.md</text>
+  <text x="300" y="320" fill="#08d9d6" font-family="monospace" font-size="7" opacity="0.15"
+        transform="rotate(-8 300 320)">digests.jsonl</text>
+
+  <!-- Scanline overlay -->
+  <rect width="400" height="400" rx="40" fill="url(#scanlines)"/>
 </svg>
