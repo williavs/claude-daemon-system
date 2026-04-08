@@ -90,24 +90,25 @@ RULES
 echo "" >> "$prompt_file"
 echo "## Live Signals (collected $(date -u +%H:%M)Z)" >> "$prompt_file"
 
-# HN top 20
+# HN top 20 -- include real item URLs so the model cites verified IDs
 echo "### HackerNews" >> "$prompt_file"
 curl -sf 'https://hacker-news.firebaseio.com/v0/topstories.json' 2>/dev/null | jq '.[0:20]' | jq -r '.[]' | while read -r id; do
+    item_url="https://news.ycombinator.com/item?id=${id}"
     curl -sf "https://hacker-news.firebaseio.com/v0/item/${id}.json" 2>/dev/null \
-        | jq -r '"- \(.title // "?") (\(.score // 0)pts, \(.descendants // 0) comments)"' 2>/dev/null
+        | jq -r --arg url "$item_url" '"- \(.title // "?") (\(.score // 0)pts, \(.descendants // 0) comments) \($url)"' 2>/dev/null
 done >> "$prompt_file"
 
-# GitHub trending
+# GitHub trending -- include real repo URLs
 echo "" >> "$prompt_file"
 echo "### GitHub Trending (7d)" >> "$prompt_file"
 curl -sf "https://api.github.com/search/repositories?q=created:>$(date -u -d '7 days ago' +%Y-%m-%d 2>/dev/null || date -u -v-7d +%Y-%m-%d)&sort=stars&order=desc&per_page=15" 2>/dev/null \
-    | jq -r '.items[]? | select(.stargazers_count < 50000) | "- \(.full_name) (\(.stargazers_count)★, \(.forks_count) forks): \(.description // "no desc")"' >> "$prompt_file" 2>/dev/null
+    | jq -r '.items[]? | select(.stargazers_count < 50000) | "- \(.full_name) (\(.stargazers_count)★, \(.forks_count) forks): \(.description // "no desc") \(.html_url)"' >> "$prompt_file" 2>/dev/null
 
-# Lobsters
+# Lobsters -- include real story URLs
 echo "" >> "$prompt_file"
 echo "### Lobsters" >> "$prompt_file"
 curl -sf 'https://lobste.rs/hottest.json' 2>/dev/null \
-    | jq -r '.[0:10] | .[] | "- \(.title) [\(.tags | join(","))]"' >> "$prompt_file" 2>/dev/null
+    | jq -r '.[0:10] | .[] | "- \(.title) [\(.tags | join(","))] \(.short_id_url // .url)"' >> "$prompt_file" 2>/dev/null
 
 # Demand signals via searxng
 echo "" >> "$prompt_file"
@@ -152,6 +153,13 @@ If a claim comes from your training data and NOT from the search results above, 
 If nothing real emerged from the research, just say so.
 FOOTER
 
+# Extract every URL from the research context -- this becomes the allowlist
+# for validation. Any URL in the draft output that's not in this list (and
+# doesn't resolve via HTTP HEAD) is a hallucination.
+ALLOWED_URLS_FILE="$LOGS_DIR/scans/allowed-urls-${TODAY}.txt"
+grep -oE 'https?://[^[:space:])]+' "$prompt_file" | sed 's/[.,;:]*$//' | sort -u > "$ALLOWED_URLS_FILE"
+echo "Allowlist: $(wc -l < "$ALLOWED_URLS_FILE") URLs from research"
+
 # Resolve model: gemini-3-flash when LiteLLM is on, else configured scan model
 DRAFT_MODEL=$(resolve_model "$SCAN_MODEL")
 
@@ -190,6 +198,78 @@ if [ "$draft" = "No output" ] || [ ${#draft} -lt 100 ]; then
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$draft_cost" "$draft_turns" >> "$LOGS_DIR/activity.jsonl"
     rm -f "$prompt_file"
     exit 0
+fi
+
+# --- URL VALIDATION (STRICT ALLOWLIST) ---
+# Extract every URL from the draft. A URL is VALID only if it came from
+# a verified source: either the pre-scraped research OR the session transcript
+# (which captures what the model fetched via WebSearch/WebFetch/mcp tools).
+#
+# We do NOT trust URLs that merely resolve -- HN returns 200 for random item
+# IDs even when the content is unrelated. Strict allowlist is the only
+# reliable defense against hallucinated citations.
+echo "Validating URLs in draft..."
+
+# Extend the allowlist with URLs from the session transcript (tool results)
+session_id=$(echo "$draft_raw" | jq -r '.session_id // empty' 2>/dev/null)
+if [ -n "$session_id" ]; then
+    # Find the transcript file for this session across all project dirs
+    transcript=$(find ~/.claude/projects -name "${session_id}.jsonl" 2>/dev/null | head -1)
+    if [ -n "$transcript" ] && [ -f "$transcript" ]; then
+        # Extract every URL from tool results and append to allowlist
+        grep -oE 'https?://[^"\\[:space:]]+' "$transcript" 2>/dev/null \
+            | sed 's/[.,;:]*$//' | sort -u >> "$ALLOWED_URLS_FILE"
+        sort -u "$ALLOWED_URLS_FILE" -o "$ALLOWED_URLS_FILE"
+        echo "Extended allowlist with transcript URLs: $(wc -l < "$ALLOWED_URLS_FILE") total"
+    fi
+fi
+
+DRAFT_URLS=$(echo "$draft" | grep -oE 'https?://[^[:space:])]+' | sed 's/[.,;:]*$//' | sort -u)
+INVALID_URLS=""
+INVALID_COUNT=0
+VALID_COUNT=0
+
+while IFS= read -r url; do
+    [ -z "$url" ] && continue
+    # STRICT: must be in allowlist (pre-scraped research + session transcript)
+    if grep -qxF "$url" "$ALLOWED_URLS_FILE"; then
+        VALID_COUNT=$((VALID_COUNT + 1))
+        continue
+    fi
+    # Also accept if a prefix match exists (query strings can differ)
+    base_url="${url%%\?*}"
+    if grep -qF "$base_url" "$ALLOWED_URLS_FILE"; then
+        VALID_COUNT=$((VALID_COUNT + 1))
+        continue
+    fi
+    INVALID_COUNT=$((INVALID_COUNT + 1))
+    INVALID_URLS="${INVALID_URLS}${url}|"
+done <<< "$DRAFT_URLS"
+
+echo "URL validation: $VALID_COUNT valid, $INVALID_COUNT hallucinated"
+
+# If any URLs are hallucinated, strip them from the draft
+if [ "$INVALID_COUNT" -gt 0 ]; then
+    echo "Stripping hallucinated URLs..."
+    # Log the bad URLs for debugging
+    printf '{"ts":"%s","action":"url_hallucination","count":%d,"urls":"%s"}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$INVALID_COUNT" "${INVALID_URLS%|}" \
+        >> "$LOGS_DIR/activity.jsonl"
+
+    # Strip each bad URL from the draft
+    draft_fixed="$draft"
+    IFS='|' read -ra bad_urls <<< "${INVALID_URLS%|}"
+    for bad_url in "${bad_urls[@]}"; do
+        # Escape special regex chars
+        escaped=$(echo "$bad_url" | sed 's/[\/&]/\\&/g')
+        draft_fixed=$(echo "$draft_fixed" | sed "s|$escaped|[URL REMOVED - hallucinated]|g")
+    done
+
+    # Append a warning footer so you know something got removed
+    draft="$draft_fixed
+
+---
+NOTE: $INVALID_COUNT URL(s) were removed from this email because they could not be verified (hallucinated by the model). If you see [URL REMOVED], that citation failed validation."
 fi
 
 # --- STAGE 3: Verify + Rework (sonnet checks claims, rewrites if needed) ---
