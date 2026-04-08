@@ -225,14 +225,10 @@ ${description}${lessons_context}"
     local start_time output exit_code
     start_time=$(date +%s%N)
 
-    # Map model shortnames to actual model IDs
+    # Resolve model -- routes to gemini-3-flash via LiteLLM when enabled,
+    # otherwise maps shortname to Claude model ID.
     local model_id
-    case "$model" in
-        haiku)  model_id="claude-haiku-4-5" ;;
-        sonnet) model_id="claude-sonnet-4-6" ;;
-        opus)   model_id="claude-opus-4-6" ;;
-        *)      model_id="$model" ;; # allow passing full ID directly
-    esac
+    model_id=$(resolve_model "$model")
 
     # Per-task tool restrictions (default: read-only + bash for commands)
     local allowed_tools max_turns
@@ -257,17 +253,24 @@ ${description}${lessons_context}"
     tokens_out=$(echo "$output" | jq '.usage.output_tokens // 0' 2>/dev/null || echo 0)
     total_tokens=$((tokens_in + tokens_out))
 
-    # Calculate cost (approximate, using python3 since bc isn't on Arch)
-    case "$model" in
-        haiku)  cost=$(python3 -c "print(f'{$tokens_in * 0.0000008 + $tokens_out * 0.000004:.6f}')") ;;
-        sonnet) cost=$(python3 -c "print(f'{$tokens_in * 0.000003 + $tokens_out * 0.000015:.6f}')") ;;
-        opus)   cost=$(python3 -c "print(f'{$tokens_in * 0.000015 + $tokens_out * 0.000075:.6f}')") ;;
-        *)      cost=0 ;;
-    esac
+    # Calculate REAL cost.
+    # When LiteLLM is enabled, query it for actual rates. Otherwise fall back
+    # to the hardcoded Claude rates (which match Claude Code's internal table).
+    if [ "$LITELLM_ENABLED" = "true" ]; then
+        cost=$(echo "$output" | "$SCRIPT_DIR/bin/cd-real-cost" 2>/dev/null \
+            | jq -r '.real_cost_usd // 0' 2>/dev/null || echo 0)
+    else
+        case "$model" in
+            haiku)  cost=$(python3 -c "print(f'{$tokens_in * 0.0000008 + $tokens_out * 0.000004:.6f}')") ;;
+            sonnet) cost=$(python3 -c "print(f'{$tokens_in * 0.000003 + $tokens_out * 0.000015:.6f}')") ;;
+            opus)   cost=$(python3 -c "print(f'{$tokens_in * 0.000015 + $tokens_out * 0.000075:.6f}')") ;;
+            *)      cost=0 ;;
+        esac
+    fi
 
     # Record to budget
     budget_record "$total_tokens"
-    log_cost "$model" "$tokens_in" "$tokens_out" "$cost"
+    log_cost "$model_id" "$tokens_in" "$tokens_out" "$cost"
 
     # Extract the text result -- no truncation at capture time.
     # Store full result in task file. Only truncate for self-review input.
@@ -294,7 +297,7 @@ Result: ${review_input}"
                 2>/dev/null) || true
             if [ -n "$review" ]; then
                 # Use jq for safe JSON encoding -- no manual escaping
-                jq -n \
+                jq -cn \
                     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
                     --arg task_id "$task_id" \
                     --arg subject "$subject" \

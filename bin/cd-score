@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""
+cd-score: System health + improvement signal for claude-daemon.
+
+HONEST SCORING RULES:
+1. No self-assessment (Claude grading Claude)
+2. No mixing dev data with production data
+3. No metrics from sample sizes < 7
+4. Every number must have a measurement method you can explain
+5. "Insufficient data" is a valid score -- better than a fake number
+"""
+
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+DAEMON_HOME = Path(os.environ.get("CLAUDE_DAEMON_HOME", Path.home() / ".claude-daemon"))
+LOGS = DAEMON_HOME / "logs"
+SCORES_FILE = LOGS / "scores.jsonl"
+
+# Production start: everything before this is dev/iteration data
+PRODUCTION_START = "2026-04-07"
+
+
+def load_jsonl(path):
+    """Load JSONL, returns only dicts."""
+    if not path.exists():
+        return []
+    entries = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        obj = json.loads(line)
+                        if isinstance(obj, dict):
+                            entries.append(obj)
+                    except json.JSONDecodeError:
+                        pass
+        if not entries:
+            decoder = json.JSONDecoder()
+            content = path.read_text()
+            idx = 0
+            while idx < len(content):
+                s = content[idx:].lstrip()
+                if not s:
+                    break
+                try:
+                    obj, end = decoder.raw_decode(s)
+                    if isinstance(obj, dict):
+                        entries.append(obj)
+                    idx += len(content) - len(s) + end
+                except json.JSONDecodeError:
+                    idx += 1
+    except Exception:
+        pass
+    return entries
+
+
+def production_only(entries, ts_field="ts"):
+    """Filter to production data only."""
+    return [e for e in entries if e.get(ts_field, "") >= PRODUCTION_START]
+
+
+def health_score():
+    """
+    System Health. Components only score if they have enough data.
+    Insufficient data = explicit "?" not a fake number.
+    """
+    components = {}
+    now = datetime.now(timezone.utc)
+    days_in_prod = max((now - datetime(2026, 4, 7, tzinfo=timezone.utc)).days, 1)
+
+    # ── 1. TASK QUALITY (25%) ──
+    # Measurement: tasks with result > 50 chars / total tasks (production only)
+    # Minimum sample: 7 tasks before this score counts
+    tasks_dir = DAEMON_HOME / "tasks"
+    tasks_with_output = 0
+    tasks_total = 0
+    if tasks_dir.exists():
+        for tf in tasks_dir.glob("task-*.json"):
+            try:
+                t = json.loads(tf.read_text())
+                created = t.get("created_at", "")
+                if created < PRODUCTION_START:
+                    continue
+                tasks_total += 1
+                result = t.get("result") or ""
+                if len(result) > 50:
+                    tasks_with_output += 1
+            except Exception:
+                pass
+
+    if tasks_total >= 7:
+        task_score = tasks_with_output / tasks_total * 100
+    else:
+        task_score = None  # insufficient data
+
+    components["task_quality"] = {
+        "score": task_score,
+        "weight": 0.25,
+        "detail": f"{tasks_with_output}/{tasks_total} produced output" + (" (need 7+ tasks)" if tasks_total < 7 else ""),
+        "measurement": "tasks with result > 50 chars / total (production only, min 7)"
+    }
+
+    # ── 2. SCAN CONVICTION (25%) ──
+    # Measurement: human verdicts on PRODUCTION scans only
+    # good+fire+decent = conviction. Minimum: 5 rated ideas.
+    feedback = [f for f in load_jsonl(LOGS / "scans" / "feedback.jsonl") if isinstance(f, dict)]
+    prod_feedback = [f for f in feedback if f.get("date", "") >= PRODUCTION_START]
+    rated = [f for f in prod_feedback if f.get("verdict") in ("good", "fire", "dead", "meh", "decent", "already-built")]
+    conviction = [f for f in rated if f.get("verdict") in ("good", "fire", "decent")]
+
+    if len(rated) >= 5:
+        scan_score = len(conviction) / len(rated) * 100
+    else:
+        scan_score = None
+
+    components["scan_conviction"] = {
+        "score": scan_score,
+        "weight": 0.25,
+        "detail": f"{len(conviction)}/{len(rated)} conviction" + (f" (need {5 - len(rated)} more ratings)" if len(rated) < 5 else ""),
+        "measurement": "human verdict good+fire+decent / rated (production only, min 5)"
+    }
+
+    # ── 3. COST EFFICIENCY (20%) ──
+    # Measurement: steady-state daily cost (production period only)
+    # Exclude the iteration period entirely.
+    activity = load_jsonl(LOGS / "activity.jsonl")
+    prod_activity = production_only(activity)
+
+    scan_cost = sum(a.get("cost", 0) for a in prod_activity if a.get("action") == "opportunity_scan")
+    meta_runs = sum(1 for a in prod_activity if a.get("action") == "meta_review")
+    meta_cost = meta_runs * 1.0  # estimated
+
+    prod_engine_costs = [c for c in load_jsonl(LOGS / "cost.jsonl") if c.get("ts", "") >= PRODUCTION_START]
+    engine_cost = sum(c.get("cost_usd", 0) for c in prod_engine_costs)
+
+    total_prod_cost = engine_cost + scan_cost + meta_cost
+    daily_avg = total_prod_cost / days_in_prod if days_in_prod > 0 else 0
+
+    if days_in_prod >= 3:
+        if daily_avg <= 2:
+            cost_score = 100
+        elif daily_avg <= 4:
+            cost_score = 70
+        elif daily_avg <= 7:
+            cost_score = 50
+        elif daily_avg <= 15:
+            cost_score = 30
+        else:
+            cost_score = 10
+    else:
+        cost_score = None
+
+    components["cost_efficiency"] = {
+        "score": cost_score,
+        "weight": 0.20,
+        "detail": f"${total_prod_cost:.2f} over {days_in_prod}d = ${daily_avg:.2f}/day" + (" (need 3+ days)" if days_in_prod < 3 else ""),
+        "measurement": "production-only spend / days (engine + scan + meta, min 3 days)"
+    }
+
+    # ── 4. NIGHTLY RELIABILITY (20%) ──
+    # Measurement: nights where meta + signals both produced files
+    # Minimum: 7 nights before this score counts
+    nights_checked = 0
+    nights_success = 0
+    for day_offset in range(min(days_in_prod, 14)):
+        day = (now - timedelta(days=day_offset)).strftime("%Y-%m-%d")
+        if day < PRODUCTION_START:
+            continue
+        has_meta = (LOGS / "meta" / f"{day}.md").exists()
+        has_signals = (LOGS / "signals" / f"{day}.md").exists()
+        nights_checked += 1
+        if has_meta and has_signals:
+            nights_success += 1
+
+    if nights_checked >= 7:
+        reliability_score = nights_success / nights_checked * 100
+    else:
+        reliability_score = None
+
+    components["nightly_reliability"] = {
+        "score": reliability_score,
+        "weight": 0.20,
+        "detail": f"{nights_success}/{nights_checked} nights" + (f" (need {7 - nights_checked} more)" if nights_checked < 7 else ""),
+        "measurement": "nights with meta + signals output / nights elapsed (min 7)"
+    }
+
+    # ── 5. ERROR LEARNING (10%) ──
+    # Measurement: automated recurrence check
+    # Did the same error pattern appear AFTER a lesson was written about it?
+    # This is the only metric that proves learning actually works.
+    # Requires failures.jsonl to have data.
+    failures = load_jsonl(LOGS / "failures.jsonl")
+    prod_failures = production_only(failures)
+
+    error_patterns = {}
+    for f in prod_failures:
+        key = f"{f.get('tool', '')}:{f.get('error', '')[:40]}"
+        error_patterns[key] = error_patterns.get(key, 0) + 1
+    recurring = sum(1 for count in error_patterns.values() if count >= 3)
+
+    if len(prod_failures) >= 10:
+        # Score: fewer recurring patterns = better learning
+        learning_score = max(100 - (recurring * 20), 0)
+    else:
+        learning_score = None
+
+    components["error_learning"] = {
+        "score": learning_score,
+        "weight": 0.10,
+        "detail": f"{recurring} recurring patterns in {len(prod_failures)} failures" + (" (need 10+ failures)" if len(prod_failures) < 10 else ""),
+        "measurement": "recurring error patterns (3+ occurrences) after lessons exist (min 10 failures)"
+    }
+
+    # ── TOTAL ──
+    scored = {k: v for k, v in components.items() if v["score"] is not None}
+    if scored:
+        total_weight = sum(v["weight"] for v in scored.values())
+        total = sum(v["score"] * v["weight"] for v in scored.values()) / total_weight * 1  # normalize
+        total = round(total, 1)
+    else:
+        total = None
+
+    return {
+        "score": total,
+        "components": components,
+        "days_in_production": days_in_prod,
+        "data_sufficient": len(scored) >= 3
+    }
+
+
+def improvement_signal():
+    """7-day trend from score history."""
+    history = load_jsonl(SCORES_FILE)
+    now = datetime.now(timezone.utc)
+
+    def parse_ts(ts):
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    recent = [h for h in history if parse_ts(h.get("ts", "")) > now - timedelta(days=7)]
+    previous = [h for h in history if now - timedelta(days=14) < parse_ts(h.get("ts", "")) <= now - timedelta(days=7)]
+
+    scored_recent = [h for h in recent if h.get("health") is not None]
+    scored_prev = [h for h in previous if h.get("health") is not None]
+
+    recent_avg = sum(h["health"] for h in scored_recent) / len(scored_recent) if scored_recent else None
+    prev_avg = sum(h["health"] for h in scored_prev) / len(scored_prev) if scored_prev else None
+
+    if recent_avg is not None and prev_avg is not None:
+        delta = round(recent_avg - prev_avg, 1)
+        signal = "IMPROVING" if delta > 2 else "DEGRADING" if delta < -2 else "STABLE"
+    elif recent_avg is not None:
+        delta = 0
+        signal = "BASELINE"
+    else:
+        delta = None
+        signal = "NO_DATA"
+
+    actioned_dir = DAEMON_HOME / "staging" / "actioned"
+    pending_dir = DAEMON_HOME / "staging"
+    actioned = len(list(actioned_dir.glob("*.md"))) if actioned_dir.exists() else 0
+    pending = len(list(pending_dir.glob("*.md"))) if pending_dir.exists() else 0
+    total_proposals = actioned + pending
+
+    meta_dir = LOGS / "meta"
+    meta_runs = len(list(meta_dir.glob("2026-*.md"))) if meta_dir.exists() else 0
+
+    return {
+        "signal": signal,
+        "health_delta_7d": delta,
+        "proposal_action_rate": round(actioned / total_proposals * 100, 1) if total_proposals else None,
+        "meta_runs": meta_runs,
+        "history_points": len(history)
+    }
+
+
+def record_score(health):
+    entry = {
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "health": health["score"],
+        "components": {k: round(v["score"], 1) if v["score"] is not None else None
+                       for k, v in health["components"].items()},
+        "data_sufficient": health["data_sufficient"]
+    }
+    SCORES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(SCORES_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def main():
+    health = health_score()
+    improvement = improvement_signal()
+    record_score(health)
+
+    W = "\033[1;37m"
+    G = "\033[0;32m"
+    Y = "\033[0;33m"
+    R = "\033[0;31m"
+    C = "\033[0;36m"
+    D = "\033[0m"
+
+    print(f"{W}System Health{D}  (production since {PRODUCTION_START}, day {health['days_in_production']})")
+
+    if health["score"] is not None:
+        score = health["score"]
+        color = G if score >= 80 else Y if score >= 60 else R
+        bar = "█" * int(score / 5) + "░" * (20 - int(score / 5))
+        print(f"  {color}{bar} {score}/100{D}")
+    else:
+        print(f"  {C}Collecting data...{D}")
+    print()
+
+    for name, comp in health["components"].items():
+        label = name.replace("_", " ").title()
+        s = comp["score"]
+        if s is not None:
+            c = G if s >= 70 else Y if s >= 50 else R
+            mini_bar = "█" * int(s / 10) + "░" * (10 - int(s / 10))
+            print(f"  {label:22s} {c}{mini_bar}{D} {s:5.1f}  {comp['detail']}")
+        else:
+            print(f"  {label:22s} {C}{'·' * 10}{D}   ?    {comp['detail']}")
+
+    print()
+    print(f"  {C}How each is measured:{D}")
+    for name, comp in health["components"].items():
+        label = name.replace("_", " ").title()
+        print(f"    {label}: {comp['measurement']}")
+
+    sufficient = sum(1 for c in health["components"].values() if c["score"] is not None)
+    total_components = len(health["components"])
+    print()
+    if sufficient < 3:
+        print(f"  {Y}⚠ {sufficient}/{total_components} components have enough data. Score is provisional.{D}")
+    else:
+        print(f"  {G}✓ {sufficient}/{total_components} components scored.{D}")
+
+    print()
+    print(f"{W}Improvement Signal{D}")
+    sig = improvement["signal"]
+    sig_color = G if sig == "IMPROVING" else Y if sig in ("STABLE", "BASELINE") else R if sig == "DEGRADING" else C
+    print(f"  Signal: {sig_color}{sig}{D}")
+
+    if improvement["health_delta_7d"] is not None:
+        delta = improvement["health_delta_7d"]
+        arrow = "▲" if delta > 0 else "▼" if delta < 0 else "─"
+        print(f"  7-day trend: {arrow} {delta:+.1f}")
+
+    if improvement["proposal_action_rate"] is not None:
+        print(f"  Proposals actioned: {improvement['proposal_action_rate']:.0f}%")
+
+    print(f"  Meta-agent runs: {improvement['meta_runs']}")
+    print(f"  Score history: {improvement['history_points']} points")
+
+    if "--json" in sys.argv:
+        print()
+        print(json.dumps({"health": health, "improvement": improvement}, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()

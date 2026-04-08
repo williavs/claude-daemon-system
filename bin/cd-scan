@@ -71,7 +71,21 @@ for line in open('$LOGS_DIR/scans/feedback.jsonl'):
 fi
 
 echo "" >> "$prompt_file"
-echo "Read the feedback verdicts. Every dev-tools idea has been rejected. The mission is non-technical buyers." >> "$prompt_file"
+cat >> "$prompt_file" << 'RULES'
+## Variation Rules (ENFORCED)
+
+Read the past ideas above. Before pitching today's idea, check:
+
+1. **Different BUYER than the last 3 picks.** If recent ideas targeted solo service pros (plumbers, realtors, contractors), today's buyer must be someone else entirely: teachers, nurses, accountants, musicians, estate planners, food truck operators, dentists, etc. Pick a specific profession we have NOT pitched before.
+
+2. **Different PAIN POINT category.** If recent ideas were about communication (missed calls, follow-ups, CRM), today's idea targets a different pain: inventory, scheduling, compliance, knowledge capture, customer education, billing, etc.
+
+3. **Different DELIVERY CHANNEL.** If recent ideas were SMS/voice, try web app, mobile, email, PDF, physical device, hosted dashboard. Vary the interface.
+
+Feedback signal so far: every dev-tools idea rejected, Rebound/voice-admin ideas noted but Willy explicitly said "variation." The convergence is the problem today -- not the signal quality.
+
+If you look at the data and genuinely cannot find a non-repeat opportunity, say "No new territory today. The scanner keeps landing on the same space. Broaden the search sources." Do NOT pitch Rebound or any service-business-CRM variant again.
+RULES
 
 echo "" >> "$prompt_file"
 echo "## Live Signals (collected $(date -u +%H:%M)Z)" >> "$prompt_file"
@@ -138,11 +152,18 @@ If a claim comes from your training data and NOT from the search results above, 
 If nothing real emerged from the research, just say so.
 FOOTER
 
+# Resolve model: gemini-3-flash when LiteLLM is on, else configured scan model
+DRAFT_MODEL=$(resolve_model "$SCAN_MODEL")
+
+# --effort max is Anthropic-only (extended thinking). Skip when on LiteLLM.
+EFFORT_FLAG=""
+[ "$LITELLM_ENABLED" != "true" ] && EFFORT_FLAG="--effort max"
+
 # Run pass 1: draft with citations
 draft_raw=$(claude -p "$(cat "$prompt_file")" \
-    --model "$SCAN_MODEL" \
+    --model "$DRAFT_MODEL" \
     --max-turns "$SCAN_TURNS" \
-    --effort max \
+    $EFFORT_FLAG \
     --allowedTools "WebSearch,WebFetch,mcp__reddit-mcp__*,Bash(npx nia-docs:*)" \
     --max-budget-usd "$SCAN_BUDGET" \
     --dangerously-skip-permissions \
@@ -150,7 +171,12 @@ draft_raw=$(claude -p "$(cat "$prompt_file")" \
     2>/dev/null)
 
 draft=$(echo "$draft_raw" | jq -r '.result // "No output"')
-draft_cost=$(echo "$draft_raw" | jq -r '.total_cost_usd // 0')
+# Compute real cost (LiteLLM-aware)
+if [ "$LITELLM_ENABLED" = "true" ]; then
+    draft_cost=$(echo "$draft_raw" | "$SCRIPT_DIR/bin/cd-real-cost" 2>/dev/null | jq -r '.real_cost_usd // 0')
+else
+    draft_cost=$(echo "$draft_raw" | jq -r '.total_cost_usd // 0')
+fi
 draft_turns=$(echo "$draft_raw" | jq -r '.num_turns // 0')
 
 # Check if draft has content
@@ -188,17 +214,21 @@ You MUST include the full email text in your output. The email is what gets sent
 DRAFT:
 $draft"
 
-# Haiku for verification -- no tools, just reasoning about plausibility.
-# Sonnet burns turns trying to search; haiku just evaluates and rewrites.
+# Verification pass -- gemini-3-flash (or haiku when LiteLLM is off).
+VERIFY_MODEL=$(resolve_model "haiku")
 verified_raw=$(claude -p "$verify_prompt" \
-    --model claude-haiku-4-5 \
+    --model "$VERIFY_MODEL" \
     --max-turns 2 \
     --dangerously-skip-permissions \
     --output-format json \
     2>/dev/null)
 
 verified=$(echo "$verified_raw" | jq -r '.result // "No output"')
-verify_cost=$(echo "$verified_raw" | jq -r '.total_cost_usd // 0')
+if [ "$LITELLM_ENABLED" = "true" ]; then
+    verify_cost=$(echo "$verified_raw" | "$SCRIPT_DIR/bin/cd-real-cost" 2>/dev/null | jq -r '.real_cost_usd // 0')
+else
+    verify_cost=$(echo "$verified_raw" | jq -r '.total_cost_usd // 0')
+fi
 verify_turns=$(echo "$verified_raw" | jq -r '.num_turns // 0')
 
 # Use verified version if it has content, otherwise fall back to draft

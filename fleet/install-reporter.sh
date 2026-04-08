@@ -23,11 +23,11 @@ MACHINE=$(hostname)
   ps aux --sort=-%mem 2>/dev/null | head -8 || true
   who 2>/dev/null || true
 } > /tmp/health-report.txt 2>&1
-if [ "$MACHINE" = "${FLEET_HEALTH_DEST:-your-homelab}" ]; then
+if [ "$MACHINE" = "your-homelab" ]; then
     mkdir -p ~/.fleet-health
     cp /tmp/health-report.txt ~/.fleet-health/${MACHINE}.txt
 else
-    scp -q /tmp/health-report.txt "${FLEET_HEALTH_DEST:-your-homelab}:~/.fleet-health/${MACHINE}.txt" 2>/dev/null
+    scp -q /tmp/health-report.txt "your-homelab:~/.fleet-health/${MACHINE}.txt" 2>/dev/null
 fi
 REPORTER
 chmod +x "$SCRIPT_DIR/report.sh"
@@ -60,4 +60,4 @@ EOF
 systemctl --user daemon-reload
 systemctl --user enable --now fleet-health.timer
 
-echo "Installed on $(hostname). Reporting every 5 min to ${FLEET_HEALTH_DEST:-your-homelab}:~/.fleet-health/"
+echo "Installed on $(hostname). Reporting every 5 min to your-homelab:~/.fleet-health/"

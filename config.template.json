@@ -31,5 +31,13 @@
     "model": "claude-opus-4-6",
     "max_budget_usd": 2.00,
     "max_turns": 10
+  },
+
+  "litellm": {
+    "enabled": false,
+    "_comment": "Route claude -p through LiteLLM to any supported model (Gemini, Groq, etc). Dramatically cheaper than direct Anthropic calls. Requires LiteLLM server with Anthropic-compatible /v1/messages endpoint.",
+    "url": "http://localhost:4000",
+    "key": "sk-your-litellm-master-key",
+    "model": "gemini-3-flash"
   }
 }

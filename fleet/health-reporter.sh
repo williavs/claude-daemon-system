@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs on each fleet machine via systemd timer. Dumps full state to fleet health destination.
+# Runs on each fleet machine via systemd timer. Dumps full state to your-homelab.
 # No filtering, no thresholds -- just raw state. The daemon interprets it.
 set -uo pipefail
 
@@ -21,7 +21,7 @@ DEST_DIR=".fleet-health"
 } > /tmp/health-report.txt 2>&1
 
 # If we ARE the destination, just copy locally
-if [ "$MACHINE" = "$DEST" ] || [ "$MACHINE" = "${FLEET_HEALTH_DEST:-your-homelab}" ]; then
+if [ "$MACHINE" = "$DEST" ] || [ "$MACHINE" = "your-homelab" ]; then
     mkdir -p ~/${DEST_DIR}
     cp /tmp/health-report.txt ~/${DEST_DIR}/${MACHINE}.txt
 else

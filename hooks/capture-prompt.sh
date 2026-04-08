@@ -26,7 +26,7 @@ project=$(basename "${CLAUDE_PROJECT_DIR:-$(pwd)}" 2>/dev/null || echo "unknown"
 # Trim to first 500 chars -- enough for intent, not a full paste
 trimmed=$(echo "$prompt_text" | head -c 500 | tr '\n' ' ' | sed 's/  */ /g')
 
-jq -n --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg session "$session" \
     --arg project "$project" \
     --arg prompt "$trimmed" \

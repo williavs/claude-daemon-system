@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# cd-briefing: Show today's morning briefing (or most recent).
+set -euo pipefail
+source "$(dirname "$0")/../lib/config.sh"
+
+TODAY=$(date -u +%Y-%m-%d)
+
+# Check current briefing first, then archived
+briefing=""
+if [ -f "$LOGS_DIR/briefing.md" ] && [ -s "$LOGS_DIR/briefing.md" ]; then
+    briefing=$(cat "$LOGS_DIR/briefing.md")
+elif [ -f "$LOGS_DIR/briefings/${TODAY}.md" ] && [ -s "$LOGS_DIR/briefings/${TODAY}.md" ]; then
+    briefing=$(cat "$LOGS_DIR/briefings/${TODAY}.md")
+else
+    # Find most recent
+    latest=$(ls -t "$LOGS_DIR/briefings"/*.md 2>/dev/null | head -1)
+    if [ -n "$latest" ]; then
+        briefing=$(cat "$latest")
+        echo "(Most recent: $(basename "$latest" .md))"
+        echo ""
+    fi
+fi
+
+if [ -n "$briefing" ]; then
+    echo "$briefing"
+else
+    echo "No briefing available. Run cd-meta to generate one."
+fi

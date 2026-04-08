@@ -17,7 +17,7 @@ MACHINE=$(tailscale status --self --json 2>/dev/null | python3 -c "import json,s
   ps aux --sort=-%mem 2>/dev/null | head -8 || ps aux | sort -k4 -rn | head -8
   who
 } > /tmp/health-report.txt 2>&1
-scp -q /tmp/health-report.txt "${FLEET_HEALTH_DEST:-your-homelab}:~/.fleet-health/${MACHINE}.txt" 2>/dev/null
+scp -q /tmp/health-report.txt "your-homelab:~/.fleet-health/${MACHINE}.txt" 2>/dev/null
 REPORTER
 chmod +x "$SCRIPT_DIR/report.sh"
 
@@ -42,4 +42,4 @@ cat > ~/Library/LaunchAgents/com.fleet-health.reporter.plist << EOF
 EOF
 
 launchctl load ~/Library/LaunchAgents/com.fleet-health.reporter.plist 2>/dev/null
-echo "Installed on $(hostname -s). Reporting every 5 min to ${FLEET_HEALTH_DEST:-your-homelab}."
+echo "Installed on $(hostname -s). Reporting every 5 min to your-homelab."

@@ -1,37 +1,26 @@
 #!/usr/bin/env bash
-# PreCompact hook: re-inject critical context before compression.
-# Ensures session coherence survives compaction.
-#
-# Reads stdin: {"trigger":"manual"|"auto","custom_instructions":"..."}
-# Outputs: {"systemMessage":"..."} to inject context post-compaction.
-
+# PreCompact hook: re-inject persist mode goal if active for THIS session.
+# Nothing else. Identity comes from peers. Context comes from CLAUDE.md.
 set -uo pipefail
 
-HANDOFF="${HOME}/.claude-daemon/state/session-handoff.md"
 PERSIST_GOAL="${HOME}/.claude-daemon/state/persist-goal.md"
+PERSIST_SESSION="${HOME}/.claude-daemon/state/persist-session"
 
-# Read stdin for compaction context
+# Not in persist mode? Nothing to inject.
+[ -f "$PERSIST_GOAL" ] || exit 0
+
+# Read session_id from stdin
 input=""
 read -t 1 -r input 2>/dev/null || true
-trigger=$(echo "$input" | python3 -c "import sys,json; print(json.load(sys.stdin).get('trigger','unknown'))" 2>/dev/null || echo "unknown")
+session_id=$(echo "$input" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || echo "")
 
-# Build the system message
-msg="CONTEXT RESTORED ($trigger compaction): You are Jim. You manage the claude-daemon system."
-
-if [ -f "$HANDOFF" ] && [ -s "$HANDOFF" ]; then
-    msg="$msg After compaction, read ~/.claude-daemon/state/session-handoff.md for full context."
+# Only inject for the session that activated persist mode
+if [ -f "$PERSIST_SESSION" ]; then
+    persist_session=$(cat "$PERSIST_SESSION")
+    [ "$persist_session" != "any" ] && [ "$persist_session" != "$session_id" ] && exit 0
 fi
 
-if [ -f "$PERSIST_GOAL" ] && [ -s "$PERSIST_GOAL" ]; then
-    goal=$(cat "$PERSIST_GOAL")
-    msg="$msg PERSIST MODE ACTIVE -- goal: $goal. Continue working, do NOT stop."
-fi
-
-msg="$msg Key: effective-go plugin shipped, effective-claude skill V2, daemon with nightly opus meta-agent at 3am, 5 fleet machines reporting, persist mode validated."
-
-# Escape for JSON
-msg=$(echo "$msg" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))" 2>/dev/null)
-
-printf '{"systemMessage": %s}\n' "$msg"
+goal=$(cat "$PERSIST_GOAL")
+printf '{"systemMessage": "PERSIST MODE ACTIVE after compaction. Goal: %s. Continue working."}\n' "$goal"
 
 exit 0

@@ -106,20 +106,54 @@ cd ~/claude-daemon
 |---------|-------------|
 | `cd-status` | Dashboard: tasks, budget, circuit breaker |
 | `cd-persist on "goal"` | Don't let Claude stop until done |
+| `cd-briefing` | Show today's morning briefing |
+| `cd-score` | System health + improvement signal (real metrics, not self-review) |
 | `cd-tokens` | Where your tokens go (hint: subagents) |
 | `cd-feedback good "reason"` | Rate today's idea, scanner learns |
 | `cd-cost` | Daemon cost breakdown |
 | `cd-review` | Full performance dashboard |
+| `cd-docs-watch` | Diff Claude Code docs, catch new features |
+| `cd-real-cost` | Compute actual cost of a claude -p call routed through LiteLLM |
 
-## What it costs
+## LiteLLM routing (optional, 6x cheaper)
+
+Claude Code respects `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`. Point those at a LiteLLM proxy and you can route all daemon calls through Gemini, Groq, or any provider with an Anthropic-compatible `/v1/messages` endpoint.
+
+```json
+"litellm": {
+  "enabled": true,
+  "url": "http://localhost:4000",
+  "key": "sk-your-litellm-master-key",
+  "model": "gemini-3-flash"
+}
+```
+
+When enabled, `resolve_model()` routes haiku/sonnet/opus requests to your configured model. `cd-real-cost` queries LiteLLM's `/model/info` for actual rates (Claude Code reports fake Anthropic rates -- you need this to see real spend).
+
+**Real cost comparison** from our production runs:
+
+| Component | Claude direct | LiteLLM + Gemini-3-flash | Savings |
+|---|---|---|---|
+| Daemon task | $0.12-0.24 | $0.02-0.06 | 4-6x |
+| Opportunity scan | $0.40-0.55 | $0.09 | 5-6x |
+| Meta-agent nightly | $3-4 (when it didn't crash) | ~$0.20 | 15-20x |
+
+## Scoring
+
+`cd-score` tracks real metrics, not self-assessment:
 
 ```
- Where tokens actually go (9.3B tokens analyzed):
+System Health  (production since 2026-04-07, day N)
+  ██████████░░░░░░░░░░ 52/100
 
- ████████████████████████████████████████████  Interactive sessions
- ██████████████████████████████               Subagents (hidden cost)
- ▎                                            claude-daemon ($0.05/day)
+  Task Quality           ███████░░░  75.0  tasks with real output / total
+  Scan Conviction        ███░░░░░░░  33.3  your feedback verdicts
+  Cost Efficiency        ███░░░░░░░  30.0  daily spend vs baseline
+  Nightly Reliability    ███████░░░  75.0  nights with meta + signals
+  Error Learning         ███░░░░░░░  38.0  fix rate vs recurring errors
 ```
+
+Components only score when they have enough data (minimum 7 tasks, 5 rated scans, 3 days of cost data). "Insufficient data" is a valid answer.
 
 The daemon is a rounding error. Your interactive sessions and subagents are the real cost. `cd-tokens` shows you exactly where.
 
