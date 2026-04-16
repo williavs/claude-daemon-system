@@ -5,6 +5,14 @@
 <h3 align="center">claude-daemon</h3>
 <p align="center">Claude Code forgets everything between sessions.<br/>This system makes it remember.</p>
 
+> **Status: superseded.** This was an early public extraction of the daemon system. The active version has evolved significantly — multi-agent convergence pipeline for opportunity scanning (3 generators + 1 synthesizer), proposal staging with operator approval, Opus 4.7, cost-tracking fallback, orphan task reclamation, and a deterministic hard-filter system. The successor is maintained in a private HFL repository.
+>
+> **Related public repos:**
+> - [sontara-lattice](https://github.com/Human-Frontier-Labs-Inc/sontara-lattice) — the original monolith where the daemon concepts were first prototyped
+> - [claude-peers-go](https://github.com/WillyV3/claude-peers-go) — peer messaging that the daemon agents use to coordinate
+> - [claude-session-metrics](https://github.com/WillyV3/claude-session-metrics) — rework-rate KPI that the daemon harness measures
+> - [claude-cap-tracker](https://github.com/WillyV3/claude-cap-tracker) — budget visibility extracted from the daemon's cost tracking
+
 ---
 
 ## The problem
